@@ -8,7 +8,7 @@
 
 - 🤖 **AI-Powered Analysis**: Natural language interface for forecasting tasks
 - 📊 **Automatic Model Selection**: Evaluates multiple models and selects the best
-- 📈 **Built-in Forecasting Models**: SES, Holt, Theta, Naive, Seasonal Naive, and more
+- 📈 **Built-in Forecasting Models**: Arima, ETS, ARARMA, TBATS, BATS, SES, Holt, Theta, Naive, Seasonal Naive, and more
 - 🔍 **Anomaly Detection**: Identifies outliers using residual analysis
 - 💬 **Interactive Queries**: Ask follow-up questions about your analysis
 - 🔌 **Extensible**: Designed to integrate with [Durbyn.jl](https://github.com/taf-society//Durbyn.jl) for advanced models
