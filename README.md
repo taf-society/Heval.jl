@@ -8,16 +8,16 @@
 
 - 🤖 **AI-Powered Analysis**: Natural language interface for forecasting tasks
 - 📊 **Automatic Model Selection**: Evaluates multiple models and selects the best
-- 📈 **Built-in Forecasting Models**: Arima, ETS, ARARMA, TBATS, BATS, SES, Holt, Theta, Naive, Seasonal Naive, and more
+- 📈 **Built-in Forecasting Models**: SES, Holt, Theta, Naive, Seasonal Naive, and more
 - 🔍 **Anomaly Detection**: Identifies outliers using residual analysis
 - 💬 **Interactive Queries**: Ask follow-up questions about your analysis
-- 🔌 **Extensible**: Designed to integrate with [Durbyn.jl](https://github.com/taf-society//Durbyn.jl) for advanced models
+- 🔌 **Extensible**: Designed to integrate with [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl) for advanced models
 
 ## Installation
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/taf-society//Heval.jl")
+Pkg.add(url="https://github.com/TAFS-Vienna/Heval.jl")
 ```
 
 ## Quick Start
@@ -44,9 +44,13 @@ println(result.best_model)       # Best performing model
 println(result.forecasts)        # Forecast values
 println(result.beats_baseline)   # Whether it beats SNaive
 
-# Ask follow-up questions
+# Ask follow-up questions — returns a QueryResult with pretty display
 answer = query(agent, "Why did you choose this model?")
-println(answer)
+# Displays a formatted box in the REPL, styled HTML in Jupyter
+
+# QueryResult is string-interoperable
+println(answer)              # prints the raw text
+msg = "Answer: " * string(answer)
 ```
 
 ## Workflow
@@ -135,6 +139,11 @@ answer = query(agent, "Your question here")
 
 Ask follow-up questions about the analysis results.
 
+**Returns**: `QueryResult` with fields:
+- `content::String` - The LLM's response text
+
+`QueryResult` pretty-prints in the REPL as a bordered box and renders styled HTML in Jupyter notebooks. It is fully string-interoperable — `string(answer)`, `println(answer)`, and string concatenation all work as expected.
+
 ### `clear_history`
 
 ```julia
@@ -160,7 +169,7 @@ data = Dict("date" => Date.(2020, 1:12), "value" => rand(12))
 
 ## Integration with Durbyn.jl
 
-For advanced models (ARIMA, ETS, BATS, TBATS, etc.), Heval can integrate with [Durbyn.jl](https://github.com/taf-society//Durbyn.jl):
+For advanced models (ARIMA, ETS, BATS, TBATS, etc.), Heval can integrate with [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl):
 
 ```julia
 using Heval
@@ -256,5 +265,13 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- Developed by [TAFS - Time Series Analysis and Forecasting Society](https://tafs.io)
+- Inspired by [TimeCopilot](https://github.com/nixtla/timecopilot) (Python)
+- Built to complement [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl)
+
+---
 
 *"Heval" (هەڤال) - Kurdish for "friend, companion"*
