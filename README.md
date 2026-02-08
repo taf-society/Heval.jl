@@ -1,26 +1,79 @@
 # Heval.jl
 
-> "Heval" means "friend" in Kurdish - your companion for time series forecasting.
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://taf-society.github.io/Heval.jl/dev/) [![Build Status](https://github.com/taf-society/Heval.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/taf-society/Heval.jl/actions/workflows/CI.yml?query=branch%3Amain) [![Coverage](https://codecov.io/gh/taf-society/Heval.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/taf-society/Heval.jl)
 
-**Heval.jl** is an AI-powered forecasting agent for Julia. It combines large language models (LLMs) with time series analysis to automate and explain forecasting workflows.
+## About
 
-## Features
+**Heval** is an AI-powered forecasting agent for Julia. It combines large language models (LLMs) with [Durbyn.jl](https://github.com/taf-society/Durbyn.jl) — a comprehensive time series forecasting library — to automate and explain forecasting workflows through natural language.
 
-- 🤖 **AI-Powered Analysis**: Natural language interface for forecasting tasks
-- 📊 **Automatic Model Selection**: Evaluates multiple models and selects the best
-- 📈 **Built-in Forecasting Models**: SES, Holt, Theta, Naive, Seasonal Naive, and more
-- 🔍 **Anomaly Detection**: Identifies outliers using residual analysis
-- 💬 **Interactive Queries**: Ask follow-up questions about your analysis
-- 🔌 **Extensible**: Designed to integrate with [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl) for advanced models
+Heval — Kurdish for "friend", embodies the idea of a helpful companion that guides you through the complexity of time series analysis with the clarity and rigor of production-grade statistical models.
+
+This package is currently under development and is part of the **TAFS Forecasting Ecosystem**, an open-source initiative.
+
+## About TAFS
+
+**TAFS (Time Series Analysis and Forecasting Society)** is a non-profit association registered as a **"Verein"** in Vienna, Austria. The organization connects a global audience of academics, experts, practitioners, and students to engage, share, learn, and innovate in the fields of data science and artificial intelligence, with a particular focus on time-series analysis, forecasting, and decision science. [TAFS](https://taf-society.org/)
+
+TAFS's mission includes:
+
+-   **Connecting**: Hosting events and discussion groups to establish connections and build a community of like-minded individuals.
+-   **Learning**: Providing a platform to learn about the latest research, real-world problems, and applications.
+-   **Sharing**: Inviting experts, academics, practitioners, and others to present and discuss problems, research, and solutions.
+-   **Innovating**: Supporting the transfer of research into solutions and helping to drive innovations.
+
+As a registered non-profit association under Austrian law, TAFS ensures that all contributions remain fully open source and cannot be privatized or commercialized. [TAFS](https://taf-society.org/)
+
+## License
+
+The Heval package is licensed under the **MIT License**, allowing for open-source distribution and collaboration.
 
 ## Installation
 
+Heval is still in development. For the latest development version, install directly from GitHub:
+
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/TAFS-Vienna/Heval.jl")
+Pkg.add(url="https://github.com/taf-society/Heval.jl")
 ```
 
+## How It Works
+
+Heval provides an AI agent that orchestrates a structured forecasting workflow. You give it time series data and a question — the agent uses LLM-guided tool calls to analyze features, select models, generate forecasts, and detect anomalies.
+
+1. **Feature Analysis** — STL decomposition, trend/seasonality detection, stationarity tests
+2. **Model Selection** — Cross-validation with MASE-based comparison across 16 models
+3. **Forecasting** — Point forecasts with model-specific 80% and 95% prediction intervals
+4. **Anomaly Detection** — Residual-based outlier detection using Z-score thresholding
+5. **Explanation** — Natural language interpretation of results
+
+All 16 forecasting models are powered by **Durbyn.jl** — production-quality implementations of ARIMA, ETS, BATS, TBATS, Theta, Croston, ARAR, and more.
+
+## Available Models (16 total)
+
+| Model | Description | Best For |
+|-------|-------------|----------|
+| **ARIMA** | Auto ARIMA with seasonal components | Complex AR/MA patterns |
+| **ETS** | Error-Trend-Seasonality (automatic) | General purpose |
+| **BATS** | Box-Cox, ARMA, Trend, Seasonal | Integer seasonal periods |
+| **TBATS** | Trigonometric BATS | Non-integer seasonalities |
+| **Theta** | Theta method (STM/OTM/DSTM/DOTM) | Competition benchmarks |
+| **SES** | Simple Exponential Smoothing | No trend, no seasonality |
+| **Holt** | Holt's linear trend | Trending, no seasonality |
+| **HoltWinters** | Seasonal Holt-Winters | Trend + seasonality |
+| **Croston** | Intermittent demand (SBA/SBJ) | Sparse demand data |
+| **ARAR** | Adaptive AR with memory reduction | Adaptive autoregression |
+| **ARARMA** | ARAR + ARMA | Adaptive + short-memory |
+| **Diffusion** | S-curve growth (Bass, Gompertz) | Technology adoption |
+| **Naive** | Last value repeated | Simplest baseline |
+| **SNaive** | Seasonal naive | Seasonal baseline |
+| **RW** | Random walk with optional drift | Stochastic baseline |
+| **Meanf** | Historical mean | Constant forecast |
+
+---
+
 ## Quick Start
+
+### OpenAI
 
 ```julia
 using Heval
@@ -35,122 +88,118 @@ data = (
     value = 100 .+ 10 .* sin.(1:36) .+ 2 .* randn(36)
 )
 
-# Run analysis
+# Run full analysis
 result = analyze(agent, data; h=12, query="Forecast next year's values")
 
-# View results
-println(result.output)           # LLM's analysis
-println(result.best_model)       # Best performing model
-println(result.forecasts)        # Forecast values
-println(result.beats_baseline)   # Whether it beats SNaive
+# Inspect results
+result.best_model       # Best performing model name
+result.beats_baseline   # Whether it beats SNaive
+result.forecasts        # ForecastOutput with point forecasts + CIs
+result.features         # SeriesFeatures (trend, seasonality, etc.)
+result.anomalies        # Detected outliers
 
-# Ask follow-up questions — returns a QueryResult with pretty display
+# Ask follow-up questions
 answer = query(agent, "Why did you choose this model?")
-# Displays a formatted box in the REPL, styled HTML in Jupyter
-
-# QueryResult is string-interoperable
-println(answer)              # prints the raw text
-msg = "Answer: " * string(answer)
 ```
 
-## Workflow
-
-Heval follows a structured forecasting workflow:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  1. FEATURE ANALYSIS                                        │
-│     - Trend detection                                       │
-│     - Seasonality assessment                                │
-│     - Intermittency check                                   │
-│     → Generates model recommendations                       │
-├─────────────────────────────────────────────────────────────┤
-│  2. MODEL SELECTION                                         │
-│     - Cross-validation with multiple models                 │
-│     - MASE-based comparison (scale-independent)             │
-│     - Must beat SNaive baseline                             │
-├─────────────────────────────────────────────────────────────┤
-│  3. FORECASTING                                             │
-│     - Generate point forecasts                              │
-│     - Compute prediction intervals (80%, 95%)               │
-├─────────────────────────────────────────────────────────────┤
-│  4. ANOMALY DETECTION                                       │
-│     - Residual-based outlier detection                      │
-│     - Z-score thresholding                                  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Available Models
-
-| Model | Description | Best For |
-|-------|-------------|----------|
-| `SES` | Simple Exponential Smoothing | No trend, no seasonality |
-| `Holt` | Holt's Linear Trend | Trend, no seasonality |
-| `Theta` | Theta Method | General purpose |
-| `Naive` | Last observation | Baseline |
-| `SNaive` | Seasonal naive | Seasonal baseline |
-| `Meanf` | Historical mean | Simple baseline |
-| `ARIMA`* | Auto-regressive integrated moving average | Complex patterns |
-| `ETS`* | Error-Trend-Seasonality | Exponential smoothing |
-| `BATS`* | Multi-seasonal (integer periods) | Multiple seasonalities |
-| `TBATS`* | Multi-seasonal (Fourier) | Non-integer seasonalities |
-| `HoltWinters`* | Seasonal Holt-Winters | Trend + seasonality |
-| `Croston`* | Intermittent demand | Sparse data |
-
-*Models marked with * use simplified implementations. For full implementations, integrate with Durbyn.jl.
-
-## API Reference
-
-### `HevalAgent`
+### Ollama (Local, No API Key)
 
 ```julia
-agent = HevalAgent(;
-    api_key::String,           # Required: OpenAI API key
-    model::String = "gpt-4o",  # LLM model to use
-    base_url::String = "https://api.openai.com/v1",
-    max_retries::Int = 3       # Retry attempts for validation
+using Heval
+
+# Using native Ollama API
+agent = HevalAgent(Val(:ollama); model="llama3.1")
+
+# Using OpenAI-compatible endpoint
+agent = HevalAgent(Val(:ollama); model="qwen2.5", use_openai_compat=true)
+
+# Same API as OpenAI agent
+result = analyze(agent, data; h=12, query="Forecast next year")
+```
+
+---
+
+## Complete Workflow Example
+
+```julia
+using Heval
+using Dates
+
+agent = HevalAgent(api_key=ENV["OPENAI_API_KEY"])
+
+# Monthly sales data (4 years)
+sales = (
+    date = Date(2020,1):Month(1):Date(2023,12),
+    value = [120, 135, 148, 152, 141, 158, 170, 165, 180, 195, 210, 225,
+             130, 145, 160, 165, 155, 172, 185, 180, 198, 215, 235, 250,
+             145, 160, 178, 185, 172, 195, 210, 205, 228, 248, 270, 290,
+             162, 180, 200, 210, 195, 225, 245, 240, 268, 295, 325, 360]
+)
+
+# 1. Run analysis
+result = analyze(agent, sales; h=12, query="Forecast next year's monthly sales")
+
+# 2. Check model performance
+println("Best model: $(result.best_model)")
+println("Beats baseline: $(result.beats_baseline)")
+
+# Model accuracy table (sorted by MASE)
+for (name, metrics) in sort(collect(result.accuracy), by=x -> x[2].mase)
+    marker = name == result.best_model ? " *" : ""
+    println("  $(name)$(marker): MASE=$(metrics.mase), RMSE=$(metrics.rmse)")
+end
+
+# 3. Access forecasts
+fc = result.forecasts
+for i in 1:fc.horizon
+    println("$(fc.dates[i]): $(round(fc.point_forecasts[i], digits=1)) " *
+            "[$(round(fc.lower_95[i], digits=1)), $(round(fc.upper_95[i], digits=1))]")
+end
+
+# 4. Check anomalies
+for a in result.anomalies
+    println("Anomaly at $(a.date): value=$(a.value), z-score=$(round(a.z_score, digits=2))")
+end
+
+# 5. Ask follow-up questions
+answer = query(agent, "What drives the seasonal pattern?")
+println(answer)
+
+answer = query(agent, "How confident are you in the forecast?")
+println(answer)
+```
+
+---
+
+## Panel Data (Multiple Series)
+
+Analyze multiple time series simultaneously:
+
+```julia
+using Heval
+using Dates
+
+# Multi-store sales data
+dates = repeat(Date(2020,1):Month(1):Date(2022,12), 3)
+stores = vcat(fill("Store_A", 36), fill("Store_B", 36), fill("Store_C", 36))
+values = vcat(
+    100 .+ 10 .* sin.(1:36) .+ 2 .* randn(36),
+    200 .+ 15 .* sin.(1:36) .+ 3 .* randn(36),
+    50 .+ 5 .* sin.(1:36) .+ randn(36)
+)
+
+panel_data = (date=dates, store=stores, value=values)
+
+agent = HevalAgent(api_key=ENV["OPENAI_API_KEY"])
+
+result = analyze(agent, panel_data;
+    h=12, m=12,
+    groupby=[:store],
+    query="Forecast next year for all stores"
 )
 ```
 
-### `analyze`
-
-```julia
-result = analyze(agent, data;
-    h::Int = nothing,          # Forecast horizon (default: 2*m)
-    m::Int = nothing,          # Seasonal period (default: 12)
-    query::String = nothing    # Natural language instructions
-)
-```
-
-**Returns**: `AgentResult` with fields:
-- `output::String` - LLM's analysis text
-- `features::SeriesFeatures` - Extracted time series features
-- `accuracy::Dict{String, AccuracyMetrics}` - Model evaluation results
-- `forecasts::ForecastOutput` - Generated forecasts
-- `anomalies::Vector{AnomalyResult}` - Detected anomalies
-- `best_model::String` - Name of best performing model
-- `beats_baseline::Bool` - Whether best model beats SNaive
-
-### `query`
-
-```julia
-answer = query(agent, "Your question here")
-```
-
-Ask follow-up questions about the analysis results.
-
-**Returns**: `QueryResult` with fields:
-- `content::String` - The LLM's response text
-
-`QueryResult` pretty-prints in the REPL as a bordered box and renders styled HTML in Jupyter notebooks. It is fully string-interoperable — `string(answer)`, `println(answer)`, and string concatenation all work as expected.
-
-### `clear_history`
-
-```julia
-clear_history(agent)
-```
-
-Reset agent state for a new analysis.
+---
 
 ## Data Formats
 
@@ -160,62 +209,26 @@ Heval accepts multiple input formats:
 # NamedTuple (recommended)
 data = (date = Date.(2020, 1:12), value = rand(12))
 
-# Vector (dates will be auto-generated)
+# Vector (dates auto-generated)
 data = rand(12)
 
 # Dict
 data = Dict("date" => Date.(2020, 1:12), "value" => rand(12))
+
+# Tables.jl-compatible (for panel data)
+data = (date=dates, store=stores, value=values)
 ```
 
-## Integration with Durbyn.jl
+---
 
-For advanced models (ARIMA, ETS, BATS, TBATS, etc.), Heval can integrate with [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl):
+## Intermittent Demand
+
+For sparse data with many zeros:
 
 ```julia
-using Heval
-using Durbyn
-
-# When Durbyn is loaded, Heval automatically uses its implementations
-agent = HevalAgent(api_key=ENV["OPENAI_API_KEY"])
-
-# Now ARIMA, ETS, etc. use full Durbyn implementations
-result = analyze(agent, data; h=12)
-```
-
-## Environment Variables
-
-```bash
-export OPENAI_API_KEY="your-api-key-here"
-```
-
-## Examples
-
-### Basic Forecasting
-
-```julia
-using Heval, Dates
-
-agent = HevalAgent(api_key=ENV["OPENAI_API_KEY"])
-
-# Monthly sales data
-sales = (
-    date = Date(2020,1):Month(1):Date(2023,12),
-    value = [120, 135, 148, 152, 141, 158, 170, 165, 180, 195, 210, 225,
-             130, 145, 160, 165, 155, 172, 185, 180, 198, 215, 235, 250,
-             145, 160, 178, 185, 172, 195, 210, 205, 228, 248, 270, 290,
-             162, 180, 200, 210, 195, 225, 245, 240, 268, 295, 325, 360]
-)
-
-result = analyze(agent, sales; h=12, query="Forecast next year's monthly sales")
-```
-
-### Intermittent Demand
-
-```julia
-# Sparse demand data (many zeros)
 demand = (
     date = Date(2023,1):Day(1):Date(2023,90),
-    value = [0,0,5,0,0,0,2,0,0,0,0,3,0,0,1,0,0,0,0,4,  # ... more zeros
+    value = [0,0,5,0,0,0,2,0,0,0,0,3,0,0,1,0,0,0,0,4,
              0,0,0,6,0,0,0,0,2,0,0,0,0,0,3,0,0,0,1,0,
              0,0,0,0,5,0,0,0,0,0,0,2,0,0,0,0,4,0,0,0,
              0,3,0,0,0,0,0,1,0,0,0,0,0,0,2,0,0,0,0,0,
@@ -226,52 +239,60 @@ result = analyze(agent, demand; m=7, h=30,
     query="This is intermittent demand data. Forecast the next month.")
 ```
 
-### Custom Model Request
+---
 
-```julia
-result = analyze(agent, data; h=12,
-    query="Use Theta method for forecasting, I want to compare with ETS")
+## Environment Variables
+
+```bash
+export OPENAI_API_KEY="your-api-key-here"
 ```
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      HevalAgent                             │
-├─────────────────────────────────────────────────────────────┤
-│  LLMConfig           │ API configuration                    │
-│  AgentState          │ Data, results, history               │
-│  Tools               │ analyze_features, cross_validate,    │
-│                      │ generate_forecast, detect_anomalies  │
-│  System Prompt       │ Workflow instructions                │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        HevalAgent                            │
+├──────────────────────────────────────────────────────────────┤
+│  LLMConfig / OllamaConfig   │ API configuration             │
+│  AgentState                  │ Data, results, history        │
+│  Tools (7 core + 2 panel)   │ analyze_features, cross_      │
+│                              │ validate, generate_forecast,  │
+│                              │ detect_anomalies, decompose,  │
+│                              │ unit_root_test, compare_models│
+│  System Prompt               │ Workflow instructions         │
+└──────────────────────────────────────────────────────────────┘
          │
          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Tool Calling Loop                                          │
-│  1. LLM receives prompt + tool definitions                  │
-│  2. LLM calls tools (analyze_features, etc.)                │
-│  3. Tool results returned to LLM                            │
-│  4. LLM generates final analysis                            │
-│  5. Validation: best model must beat SNaive                 │
-│  6. Retry if validation fails                               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Tool Calling Loop                                           │
+│  1. LLM receives prompt + tool definitions                   │
+│  2. LLM calls tools (analyze_features, etc.)                 │
+│  3. Tool results returned to LLM                             │
+│  4. LLM generates final analysis                             │
+│  5. Validation: best model must beat SNaive                  │
+│  6. Retry if validation fails (up to max_retries)            │
+└──────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Durbyn.jl (16 Models)                                       │
+│  ARIMA, ETS, BATS, TBATS, Theta, SES, Holt, HoltWinters,   │
+│  Croston, ARAR, ARARMA, Diffusion, Naive, SNaive, RW, Meanf│
+└──────────────────────────────────────────────────────────────┘
 ```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- Developed by [TAFS - Time Series Analysis and Forecasting Society](https://tafs.io)
-- Inspired by [TimeCopilot](https://github.com/nixtla/timecopilot) (Python)
-- Built to complement [Durbyn.jl](https://github.com/TAFS-Vienna/Durbyn.jl)
 
 ---
 
-*"Heval" (هەڤال) - Kurdish for "friend, companion"*
+## What's Next
+
+- **[Quick Start](https://taf-society.github.io/Heval.jl/dev/quickstart/)** — Get started with your first analysis
+- **User Guide**:
+  - [Agent Architecture](https://taf-society.github.io/Heval.jl/dev/agent/) — How the agent works under the hood
+  - [Available Models](https://taf-society.github.io/Heval.jl/dev/models/) — Detailed guide to all 16 forecasting models
+  - [Analysis Tools](https://taf-society.github.io/Heval.jl/dev/tools/) — Feature analysis, cross-validation, anomaly detection
+  - [Panel Data](https://taf-society.github.io/Heval.jl/dev/panel/) — Multi-series forecasting with grouping
+  - [Ollama Integration](https://taf-society.github.io/Heval.jl/dev/ollama/) — Local LLM setup and usage
+  - [Display & Formatting](https://taf-society.github.io/Heval.jl/dev/display/) — Rich output in REPL and Jupyter
+- **[API Reference](https://taf-society.github.io/Heval.jl/dev/api/)** — Complete API documentation
