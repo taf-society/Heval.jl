@@ -195,6 +195,9 @@ end
 
 function register_panel_tools!(agent)
     state = agent.state
-    push!(agent.tools, create_panel_analyze_tool(state))
-    push!(agent.tools, create_panel_fit_tool(state))
+    panel_tools = [create_panel_analyze_tool(state), create_panel_fit_tool(state)]
+    for t in panel_tools
+        push!(agent.tools, t)
+        agent.tool_index[t.name] = t
+    end
 end

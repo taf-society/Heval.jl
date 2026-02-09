@@ -28,6 +28,7 @@ mutable struct HevalAgent
     config::LLMConfig
     state::AgentState
     tools::Vector{Tool}
+    tool_index::Dict{String, Tool}
     system_prompt::String
     max_retries::Int
 end
@@ -58,7 +59,7 @@ function HevalAgent(;
     state = AgentState()
     system_prompt = build_system_prompt()
 
-    agent = HevalAgent(config, state, Tool[], system_prompt, max_retries)
+    agent = HevalAgent(config, state, Tool[], Dict{String, Tool}(), system_prompt, max_retries)
 
     # Register tools
     register_tools!(agent)
@@ -203,6 +204,7 @@ function register_tools!(agent::HevalAgent)
         create_unit_root_test_tool(agent.state),
         create_compare_models_tool(agent.state)
     ]
+    agent.tool_index = Dict(t.name => t for t in agent.tools)
 end
 
 # ============================================================================
@@ -363,26 +365,36 @@ For panel data, use panel_analyze → analyze_features → cross_validate or pan
     return _run_agent_loop(agent, user_prompt)
 end
 
-function _run_agent_loop(agent::HevalAgent, user_prompt::String)
+"""
+    _run_generic_agent_loop(state, tools, system_prompt, max_retries, user_prompt, call_fn, parse_fn, execute_fn)
+
+Shared agent loop used by both HevalAgent and OllamaAgent.
+`call_fn(messages, tools)` → raw response
+`parse_fn(response)` → Message
+`execute_fn(name, args)` → result Dict
+"""
+function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
+                                  system_prompt::String, max_retries::Int,
+                                  user_prompt::String,
+                                  call_fn::Function, parse_fn::Function, execute_fn::Function)
     messages = [
-        Message("system", agent.system_prompt),
+        Message("system", system_prompt),
         Message("user", user_prompt)
     ]
 
-    # Agent loop: separate tool-call rounds from baseline-beating retries
     final_output = ""
     max_tool_rounds = 20
 
-    for retry in 1:agent.max_retries
+    for retry in 1:max_retries
         for _round in 1:max_tool_rounds
-            response = call_llm(agent.config, messages, agent.tools)
-            assistant_msg = parse_llm_response(response)
+            response = call_fn(messages, tools)
+            assistant_msg = parse_fn(response)
 
             if !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
                 push!(messages, assistant_msg)
 
                 for tc in assistant_msg.tool_calls
-                    result = execute_tool(agent, tc.name, tc.arguments)
+                    result = execute_fn(tc.name, tc.arguments)
                     push!(messages, format_tool_result(tc.id, result))
                 end
 
@@ -394,11 +406,10 @@ function _run_agent_loop(agent::HevalAgent, user_prompt::String)
             break
         end
 
-        # Validate: check if best model beats baseline
-        if !isempty(agent.state.accuracy) && retry < agent.max_retries
-            best_mase = minimum(met.mase for met in Base.values(agent.state.accuracy))
-            naive_mase = haskey(agent.state.accuracy, "SNaive") ?
-                         agent.state.accuracy["SNaive"].mase : Inf
+        if !isempty(state.accuracy) && retry < max_retries
+            best_mase = minimum(met.mase for met in Base.values(state.accuracy))
+            naive_mase = haskey(state.accuracy, "SNaive") ?
+                         state.accuracy["SNaive"].mase : Inf
 
             if best_mase >= naive_mase
                 push!(messages, Message("user",
@@ -413,10 +424,9 @@ function _run_agent_loop(agent::HevalAgent, user_prompt::String)
         break
     end
 
-    # Build result
-    beats_baseline = if !isempty(agent.state.accuracy) && !isnothing(agent.state.best_model)
-        best_mase = agent.state.accuracy[agent.state.best_model].mase
-        naive_mase = get(agent.state.accuracy, "SNaive", AccuracyMetrics(model="SNaive")).mase
+    beats_baseline = if !isempty(state.accuracy) && !isnothing(state.best_model)
+        best_mase = state.accuracy[state.best_model].mase
+        naive_mase = get(state.accuracy, "SNaive", AccuracyMetrics(model="SNaive")).mase
         best_mase < naive_mase
     else
         false
@@ -424,20 +434,95 @@ function _run_agent_loop(agent::HevalAgent, user_prompt::String)
 
     return AgentResult(
         final_output,
-        agent.state.features,
-        agent.state.accuracy,
-        agent.state.forecasts,
-        agent.state.anomalies,
-        agent.state.best_model,
+        state.features,
+        state.accuracy,
+        state.forecasts,
+        state.anomalies,
+        state.best_model,
         beats_baseline
     )
 end
 
-function execute_tool(agent::HevalAgent, name::String, args::Dict)
-    for tool in agent.tools
-        if tool.name == name
-            return tool.fn(args)
+"""
+    _generic_query(state, tools, system_prompt, question, call_fn, parse_fn, execute_fn)
+
+Shared query loop used by both HevalAgent and OllamaAgent.
+"""
+function _generic_query(state::AgentState, tools::Vector{Tool},
+                        system_prompt::String, question::String,
+                        call_fn::Function, parse_fn::Function, execute_fn::Function)
+    if isnothing(state.values) && isnothing(state.panel)
+        error("No analysis has been run. Call analyze() first.")
+    end
+
+    context_parts = ["Previous analysis context:"]
+
+    if !isnothing(state.features)
+        f = state.features
+        push!(context_parts, "- Data: $(f.length) obs, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength)")
+        if f.stationarity != "unknown"
+            push!(context_parts, "- Stationarity: $(f.stationarity)")
         end
+    end
+
+    if !isempty(state.accuracy) && !isnothing(state.best_model)
+        push!(context_parts, "- Models evaluated: $(join(keys(state.accuracy), ", "))")
+        push!(context_parts, "- Best model: $(state.best_model) (MASE=$(state.accuracy[state.best_model].mase))")
+    end
+
+    if !isnothing(state.forecasts)
+        fc = state.forecasts
+        push!(context_parts, "- Forecast: $(fc.horizon) periods using $(fc.model)")
+    end
+
+    if !isempty(state.anomalies)
+        push!(context_parts, "- Anomalies detected: $(length(state.anomalies))")
+    end
+
+    if !isnothing(state.panel)
+        push!(context_parts, "- Panel data: groups=$(join(String.(state.panel.groups), ", "))")
+    end
+
+    context = join(context_parts, "\n")
+
+    messages = [
+        Message("system", system_prompt),
+        Message("user", "$context\n\nUser question: $question")
+    ]
+
+    response = call_fn(messages, tools)
+    assistant_msg = parse_fn(response)
+
+    while !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
+        push!(messages, assistant_msg)
+
+        for tc in assistant_msg.tool_calls
+            result = execute_fn(tc.name, tc.arguments)
+            push!(messages, format_tool_result(tc.id, result))
+        end
+
+        response = call_fn(messages, tools)
+        assistant_msg = parse_fn(response)
+    end
+
+    return QueryResult(something(assistant_msg.content, ""))
+end
+
+# ── HevalAgent delegates ──────────────────────────────────────────────────
+
+function _run_agent_loop(agent::HevalAgent, user_prompt::String)
+    call_fn = (msgs, tools) -> call_llm(agent.config, msgs, tools)
+    parse_fn = parse_llm_response
+    execute_fn = (name, args) -> execute_tool(agent, name, args)
+    return _run_generic_agent_loop(agent.state, agent.tools, agent.system_prompt,
+                                    agent.max_retries, user_prompt,
+                                    call_fn, parse_fn, execute_fn)
+end
+
+function execute_tool(agent::HevalAgent, name::String, args::Dict)
+    tool = get(agent.tool_index, name, nothing)
+    if !isnothing(tool)
+        return tool.fn(args)
     end
     return Dict("error" => "Unknown tool: $name")
 end
@@ -481,61 +566,11 @@ end
 Ask a follow-up question about the analysis.
 """
 function query(agent::HevalAgent, question::String)
-    if isnothing(agent.state.values) && isnothing(agent.state.panel)
-        error("No analysis has been run. Call analyze() first.")
-    end
-
-    context_parts = ["Previous analysis context:"]
-
-    if !isnothing(agent.state.features)
-        f = agent.state.features
-        push!(context_parts, "- Data: $(f.length) obs, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength)")
-        if f.stationarity != "unknown"
-            push!(context_parts, "- Stationarity: $(f.stationarity)")
-        end
-    end
-
-    if !isempty(agent.state.accuracy) && !isnothing(agent.state.best_model)
-        push!(context_parts, "- Models evaluated: $(join(keys(agent.state.accuracy), ", "))")
-        push!(context_parts, "- Best model: $(agent.state.best_model) (MASE=$(agent.state.accuracy[agent.state.best_model].mase))")
-    end
-
-    if !isnothing(agent.state.forecasts)
-        fc = agent.state.forecasts
-        push!(context_parts, "- Forecast: $(fc.horizon) periods using $(fc.model)")
-    end
-
-    if !isempty(agent.state.anomalies)
-        push!(context_parts, "- Anomalies detected: $(length(agent.state.anomalies))")
-    end
-
-    if !isnothing(agent.state.panel)
-        push!(context_parts, "- Panel data: groups=$(join(String.(agent.state.panel.groups), ", "))")
-    end
-
-    context = join(context_parts, "\n")
-
-    messages = [
-        Message("system", agent.system_prompt),
-        Message("user", "$context\n\nUser question: $question")
-    ]
-
-    response = call_llm(agent.config, messages, agent.tools)
-    assistant_msg = parse_llm_response(response)
-
-    while !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
-        push!(messages, assistant_msg)
-
-        for tc in assistant_msg.tool_calls
-            result = execute_tool(agent, tc.name, tc.arguments)
-            push!(messages, format_tool_result(tc.id, result))
-        end
-
-        response = call_llm(agent.config, messages, agent.tools)
-        assistant_msg = parse_llm_response(response)
-    end
-
-    return QueryResult(something(assistant_msg.content, ""))
+    call_fn = (msgs, tools) -> call_llm(agent.config, msgs, tools)
+    parse_fn = parse_llm_response
+    execute_fn = (name, args) -> execute_tool(agent, name, args)
+    return _generic_query(agent.state, agent.tools, agent.system_prompt, question,
+                          call_fn, parse_fn, execute_fn)
 end
 
 """

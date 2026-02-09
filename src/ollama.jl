@@ -252,7 +252,7 @@ function HevalAgent(::Val{:ollama};
         )
         state = AgentState()
         system_prompt = build_system_prompt()
-        agent = HevalAgent(config, state, Tool[], system_prompt, max_retries)
+        agent = HevalAgent(config, state, Tool[], Dict{String, Tool}(), system_prompt, max_retries)
         register_tools!(agent)
         return agent
     else
@@ -264,7 +264,7 @@ function HevalAgent(::Val{:ollama};
         )
         state = AgentState()
         system_prompt = build_system_prompt()
-        agent = OllamaAgent(config, ollama_config, state, Tool[], system_prompt, max_retries)
+        agent = OllamaAgent(config, ollama_config, state, Tool[], Dict{String, Tool}(), system_prompt, max_retries)
         register_ollama_tools!(agent)
         return agent
     end
@@ -285,6 +285,7 @@ mutable struct OllamaAgent
     ollama_config::OllamaConfig
     state::AgentState
     tools::Vector{Tool}
+    tool_index::Dict{String, Tool}
     system_prompt::String
     max_retries::Int
 end
@@ -299,13 +300,13 @@ function register_ollama_tools!(agent::OllamaAgent)
         create_unit_root_test_tool(agent.state),
         create_compare_models_tool(agent.state)
     ]
+    agent.tool_index = Dict(t.name => t for t in agent.tools)
 end
 
 function execute_ollama_tool(agent::OllamaAgent, name::String, args::Dict)
-    for tool in agent.tools
-        if tool.name == name
-            return tool.fn(args)
-        end
+    tool = get(agent.tool_index, name, nothing)
+    if !isnothing(tool)
+        return tool.fn(args)
     end
     return Dict("error" => "Unknown tool: $name")
 end
@@ -446,79 +447,21 @@ For panel data, use panel_analyze → analyze_features → cross_validate or pan
 end
 
 function _run_ollama_agent_loop(agent::OllamaAgent, user_prompt::String)
-    messages = [
-        Message("system", agent.system_prompt),
-        Message("user", user_prompt)
-    ]
-
-    # Agent loop
-    final_output = ""
-    max_tool_rounds = 20
-
-    for retry in 1:agent.max_retries
-        for _round in 1:max_tool_rounds
-            response = call_ollama(agent.ollama_config, messages, agent.tools)
-            assistant_msg = parse_ollama_response(agent.ollama_config, response)
-
-            if !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
-                push!(messages, assistant_msg)
-
-                for tc in assistant_msg.tool_calls
-                    result = execute_ollama_tool(agent, tc.name, tc.arguments)
-                    push!(messages, format_tool_result(tc.id, result))
-                end
-
-                continue
-            end
-
-            final_output = something(assistant_msg.content, "")
-            push!(messages, assistant_msg)
-            break
-        end
-
-        # Validate baseline
-        if !isempty(agent.state.accuracy) && retry < agent.max_retries
-            best_mase = minimum(met.mase for met in Base.values(agent.state.accuracy))
-            naive_mase = haskey(agent.state.accuracy, "SNaive") ?
-                         agent.state.accuracy["SNaive"].mase : Inf
-
-            if best_mase >= naive_mase
-                push!(messages, Message("user",
-                    "The best model doesn't beat the SNaive baseline. " *
-                    "Please try additional models (e.g., ARIMA, ETS, Theta) " *
-                    "and select one that outperforms SNaive."
-                ))
-                continue
-            end
-        end
-
-        break
-    end
-
-    # Build result
-    beats_baseline = if !isempty(agent.state.accuracy) && !isnothing(agent.state.best_model)
-        best_mase = agent.state.accuracy[agent.state.best_model].mase
-        naive_mase = get(agent.state.accuracy, "SNaive", AccuracyMetrics(model="SNaive")).mase
-        best_mase < naive_mase
-    else
-        false
-    end
-
-    return AgentResult(
-        final_output,
-        agent.state.features,
-        agent.state.accuracy,
-        agent.state.forecasts,
-        agent.state.anomalies,
-        agent.state.best_model,
-        beats_baseline
-    )
+    call_fn = (msgs, tools) -> call_ollama(agent.ollama_config, msgs, tools)
+    parse_fn = resp -> parse_ollama_response(agent.ollama_config, resp)
+    execute_fn = (name, args) -> execute_ollama_tool(agent, name, args)
+    return _run_generic_agent_loop(agent.state, agent.tools, agent.system_prompt,
+                                    agent.max_retries, user_prompt,
+                                    call_fn, parse_fn, execute_fn)
 end
 
 function register_ollama_panel_tools!(agent::OllamaAgent)
     state = agent.state
-    push!(agent.tools, create_panel_analyze_tool(state))
-    push!(agent.tools, create_panel_fit_tool(state))
+    panel_tools = [create_panel_analyze_tool(state), create_panel_fit_tool(state)]
+    for t in panel_tools
+        push!(agent.tools, t)
+        agent.tool_index[t.name] = t
+    end
 end
 
 """
@@ -527,54 +470,11 @@ end
 Ask a follow-up question about the analysis using Ollama.
 """
 function query(agent::OllamaAgent, question::String)
-    if isnothing(agent.state.values) && isnothing(agent.state.panel)
-        error("No analysis has been run. Call analyze() first.")
-    end
-
-    context_parts = ["Previous analysis context:"]
-
-    if !isnothing(agent.state.features)
-        f = agent.state.features
-        push!(context_parts, "- Data: $(f.length) obs, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength)")
-    end
-
-    if !isempty(agent.state.accuracy) && !isnothing(agent.state.best_model)
-        push!(context_parts, "- Models evaluated: $(join(keys(agent.state.accuracy), ", "))")
-        push!(context_parts, "- Best model: $(agent.state.best_model) (MASE=$(agent.state.accuracy[agent.state.best_model].mase))")
-    end
-
-    if !isnothing(agent.state.forecasts)
-        fc = agent.state.forecasts
-        push!(context_parts, "- Forecast: $(fc.horizon) periods using $(fc.model)")
-    end
-
-    if !isempty(agent.state.anomalies)
-        push!(context_parts, "- Anomalies detected: $(length(agent.state.anomalies))")
-    end
-
-    context = join(context_parts, "\n")
-
-    messages = [
-        Message("system", agent.system_prompt),
-        Message("user", "$context\n\nUser question: $question")
-    ]
-
-    response = call_ollama(agent.ollama_config, messages, agent.tools)
-    assistant_msg = parse_ollama_response(agent.ollama_config, response)
-
-    while !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
-        push!(messages, assistant_msg)
-
-        for tc in assistant_msg.tool_calls
-            result = execute_ollama_tool(agent, tc.name, tc.arguments)
-            push!(messages, format_tool_result(tc.id, result))
-        end
-
-        response = call_ollama(agent.ollama_config, messages, agent.tools)
-        assistant_msg = parse_ollama_response(agent.ollama_config, response)
-    end
-
-    return QueryResult(something(assistant_msg.content, ""))
+    call_fn = (msgs, tools) -> call_ollama(agent.ollama_config, msgs, tools)
+    parse_fn = resp -> parse_ollama_response(agent.ollama_config, resp)
+    execute_fn = (name, args) -> execute_ollama_tool(agent, name, args)
+    return _generic_query(agent.state, agent.tools, agent.system_prompt, question,
+                          call_fn, parse_fn, execute_fn)
 end
 
 """

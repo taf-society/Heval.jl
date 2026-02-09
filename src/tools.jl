@@ -293,58 +293,85 @@ function tool_cross_validate(state::AgentState, args::Dict)
     window_size = max(2m, div(n, 2))
 
     results = Dict{String, AccuracyMetrics}()
+    results_lock = ReentrantLock()
 
-    for model_name in model_names
-        window_maes = Float64[]
-        window_rmses = Float64[]
-        window_mapes = Float64[]
-        window_mases = Float64[]
+    @sync for model_name in model_names
+        Threads.@spawn begin
+            try
+                window_maes = Float64[]
+                window_rmses = Float64[]
+                window_mapes = Float64[]
+                window_mases = Float64[]
 
-        for w in 1:n_windows
-            train_end = window_size + (w - 1) * div(n - window_size - h, max(n_windows - 1, 1))
-            test_end = min(train_end + h, n)
+                for w in 1:n_windows
+                    train_end = window_size + (w - 1) * div(n - window_size - h, max(n_windows - 1, 1))
+                    test_end = min(train_end + h, n)
 
-            if train_end >= n || test_end > n
-                continue
-            end
+                    if train_end >= n || test_end > n
+                        continue
+                    end
 
-            train = y[1:train_end]
-            test = y[train_end+1:test_end]
-            test_h = length(test)
+                    train = y[1:train_end]
+                    test = y[train_end+1:test_end]
+                    test_h = length(test)
 
-            if test_h == 0
-                continue
-            end
+                    if test_h == 0
+                        continue
+                    end
 
-            # Generate forecast using Durbyn
-            fc = _cv_forecast(train, test_h, m, model_name, state.dates)
+                    # Generate forecast using Durbyn
+                    fc = _cv_forecast(train, test_h, m, model_name, state.dates)
 
-            # Compute per-window metrics
-            push!(window_maes, mean(abs.(test .- fc)))
-            push!(window_rmses, sqrt(mean((test .- fc) .^ 2)))
-            push!(window_mapes, mean(abs.((test .- fc) ./ max.(abs.(test), 1e-10))) * 100)
+                    # Compute per-window metrics
+                    push!(window_maes, mean(abs.(test .- fc)))
+                    push!(window_rmses, sqrt(mean((test .- fc) .^ 2)))
+                    push!(window_mapes, mean(abs.((test .- fc) ./ max.(abs.(test), 1e-10))) * 100)
 
-            # MASE using training set for seasonal naive baseline
-            n_train = length(train)
-            if n_train > m
-                naive_errors = abs.(train[m+1:end] .- train[1:end-m])
-                mae_naive = mean(naive_errors)
-                mae_fc = mean(abs.(test .- fc))
-                mase_val = mae_naive > 0 ? mae_fc / mae_naive : Inf
-                push!(window_mases, mase_val)
-            else
-                push!(window_mases, Inf)
+                    # MASE using training set for seasonal naive baseline
+                    n_train = length(train)
+                    if n_train > m
+                        naive_errors = abs.(train[m+1:end] .- train[1:end-m])
+                        mae_naive = mean(naive_errors)
+                        mae_fc = mean(abs.(test .- fc))
+                        mase_val = mae_naive > 0 ? mae_fc / mae_naive : Inf
+                        push!(window_mases, mase_val)
+                    else
+                        push!(window_mases, Inf)
+                    end
+                end
+
+                if !isempty(window_maes)
+                    metrics = AccuracyMetrics(
+                        model = model_name,
+                        mase = round(mean(window_mases), digits=4),
+                        rmse = round(mean(window_rmses), digits=2),
+                        mae = round(mean(window_maes), digits=2),
+                        mape = round(mean(window_mapes), digits=2)
+                    )
+                    lock(results_lock) do
+                        results[model_name] = metrics
+                    end
+                end
+            catch e
+                @warn "CV failed for model $model_name" exception=(e, catch_backtrace())
             end
         end
+    end
 
-        if !isempty(window_maes)
-            results[model_name] = AccuracyMetrics(
-                model = model_name,
-                mase = round(mean(window_mases), digits=4),
-                rmse = round(mean(window_rmses), digits=2),
-                mae = round(mean(window_maes), digits=2),
-                mape = round(mean(window_mapes), digits=2)
-            )
+    # Cache fitted models on full dataset (avoids re-fitting in generate_forecast)
+    fitted_lock = ReentrantLock()
+    @sync for model_name in collect(keys(results))
+        Threads.@spawn begin
+            try
+                dates_full = !isnothing(state.dates) ? state.dates :
+                    [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n]
+                fitted_model = durbyn_fit(model_name, dates_full, y, m)
+                lock(fitted_lock) do
+                    state.fitted_models[model_name] = fitted_model
+                end
+            catch
+                # Non-critical: generate_forecast will fit if missing
+            end
         end
     end
 
@@ -472,13 +499,16 @@ function tool_generate_forecast(state::AgentState, args::Dict)
     m = state.seasonal_period
     dates = state.dates
 
-    # Use Durbyn fit + forecast for proper model-specific PIs
+    # Reuse cached fitted model from CV if available, otherwise fit fresh
     try
-        result = durbyn_fit_forecast(model_name, dates, y, h, m)
-        fc = result.forecast
-
-        # Store fitted model reference for anomaly detection, re-forecasting
-        state.fitted_models[model_name] = result.fitted
+        fitted_model = get(state.fitted_models, model_name, nothing)
+        if isnothing(fitted_model)
+            result = durbyn_fit_forecast(model_name, dates, y, h, m)
+            fc = result.forecast
+            state.fitted_models[model_name] = result.fitted
+        else
+            fc = durbyn_forecast(fitted_model, h)
+        end
 
         # Extract results
         fc_data = extract_forecast_result(fc, dates, h)
@@ -878,34 +908,41 @@ function tool_compare_models(state::AgentState, args::Dict)
             [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n]
 
     comparison = Dict{String, Any}()
+    compare_lock = ReentrantLock()
 
-    for model_name in model_names
-        try
-            fitted_model = durbyn_fit(model_name, dates, y, m)
-            state.fitted_models[model_name] = fitted_model
-
-            info = Dict{String, Any}("model" => model_name)
-
-            # Try to extract information criteria
-            for field in [:aic, :aicc, :bic, :sigma2]
-                try
-                    val = getproperty(fitted_model.fit, field)
-                    if !isnothing(val) && val isa Real
-                        info[string(field)] = round(Float64(val), digits=2)
-                    end
-                catch end
-            end
-
-            # In-sample residual metrics
+    @sync for model_name in model_names
+        Threads.@spawn begin
             try
-                resid = Float64.(Durbyn.residuals(fitted_model))
-                info["rmse_insample"] = round(sqrt(mean(resid .^ 2)), digits=2)
-                info["mae_insample"] = round(mean(abs.(resid)), digits=2)
-            catch end
+                fitted_model = durbyn_fit(model_name, dates, y, m)
 
-            comparison[model_name] = info
-        catch e
-            comparison[model_name] = Dict("model" => model_name, "error" => sprint(showerror, e))
+                info = Dict{String, Any}("model" => model_name)
+
+                # Try to extract information criteria
+                for field in [:aic, :aicc, :bic, :sigma2]
+                    try
+                        val = getproperty(fitted_model.fit, field)
+                        if !isnothing(val) && val isa Real
+                            info[string(field)] = round(Float64(val), digits=2)
+                        end
+                    catch end
+                end
+
+                # In-sample residual metrics
+                try
+                    resid = Float64.(Durbyn.residuals(fitted_model))
+                    info["rmse_insample"] = round(sqrt(mean(resid .^ 2)), digits=2)
+                    info["mae_insample"] = round(mean(abs.(resid)), digits=2)
+                catch end
+
+                lock(compare_lock) do
+                    state.fitted_models[model_name] = fitted_model
+                    comparison[model_name] = info
+                end
+            catch e
+                lock(compare_lock) do
+                    comparison[model_name] = Dict("model" => model_name, "error" => sprint(showerror, e))
+                end
+            end
         end
     end
 
