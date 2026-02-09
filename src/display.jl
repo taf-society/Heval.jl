@@ -46,6 +46,124 @@ function _fmt_metric(x::Float64; pct::Bool=false)
     return s
 end
 
+# ── Agent display ───────────────────────────────────────────────────────────
+
+function _agent_status_str(state::AgentState)
+    parts = String[]
+    !isnothing(state.values) && push!(parts, "n=$(length(state.values))")
+    !isnothing(state.best_model) && push!(parts, "best=$(state.best_model)")
+    !isempty(state.accuracy) && push!(parts, "$(length(state.accuracy)) models evaluated")
+    !isnothing(state.forecasts) && push!(parts, "h=$(state.forecasts.horizon)")
+    !isnothing(state.panel) && push!(parts, "panel=$(join(String.(state.panel.groups), ","))")
+    isempty(parts) && push!(parts, "no data loaded")
+    return join(parts, ", ")
+end
+
+# HevalAgent compact
+function Base.show(io::IO, agent::HevalAgent)
+    print(io, "HevalAgent($(agent.config.model), $(_agent_status_str(agent.state)))")
+end
+
+# HevalAgent verbose
+function Base.show(io::IO, ::MIME"text/plain", agent::HevalAgent)
+    use_color = get(io, :color, false)::Bool
+    if use_color
+        printstyled(io, "HevalAgent"; bold=true)
+    else
+        print(io, "HevalAgent")
+    end
+    println(io, " — Heval.jl Forecasting Agent")
+    println(io, "  Model:    $(agent.config.model)")
+    println(io, "  Base URL: $(agent.config.base_url)")
+    println(io, "  Tools:    $(length(agent.tools)) registered")
+    println(io, "  Retries:  $(agent.max_retries)")
+    _show_agent_state(io, agent.state)
+end
+
+# OllamaAgent compact
+function Base.show(io::IO, agent::OllamaAgent)
+    backend = agent.ollama_config.use_openai_compat ? "openai-compat" : "native"
+    print(io, "OllamaAgent($(agent.ollama_config.model), $(backend), $(_agent_status_str(agent.state)))")
+end
+
+# OllamaAgent verbose
+function Base.show(io::IO, ::MIME"text/plain", agent::OllamaAgent)
+    use_color = get(io, :color, false)::Bool
+    if use_color
+        printstyled(io, "OllamaAgent"; bold=true)
+    else
+        print(io, "OllamaAgent")
+    end
+    println(io, " — Heval.jl Forecasting Agent (Ollama)")
+    println(io, "  Model:    $(agent.ollama_config.model)")
+    println(io, "  Host:     $(agent.ollama_config.host)")
+    backend = agent.ollama_config.use_openai_compat ? "OpenAI-compatible (/v1)" : "Native (/api/chat)"
+    println(io, "  Backend:  $(backend)")
+    println(io, "  Tools:    $(length(agent.tools)) registered")
+    println(io, "  Retries:  $(agent.max_retries)")
+    _show_agent_state(io, agent.state)
+end
+
+function _show_agent_state(io::IO, state::AgentState)
+    use_color = get(io, :color, false)::Bool
+
+    # Data section
+    if !isnothing(state.values)
+        n = length(state.values)
+        date_range = if !isnothing(state.dates) && !isempty(state.dates)
+            "$(state.dates[1]) to $(state.dates[end])"
+        else
+            "no dates"
+        end
+        println(io, "  Data:     $(n) obs ($(date_range)), m=$(state.seasonal_period), h=$(state.horizon)")
+    else
+        println(io, "  Data:     none loaded")
+    end
+
+    # Panel
+    if !isnothing(state.panel)
+        println(io, "  Panel:    grouped by $(join(String.(state.panel.groups), ", "))")
+    end
+
+    # Best model / accuracy
+    if !isempty(state.accuracy)
+        n_models = length(state.accuracy)
+        if !isnothing(state.best_model) && haskey(state.accuracy, state.best_model)
+            mase = _round4(state.accuracy[state.best_model].mase)
+            print(io, "  Best:     $(state.best_model) (MASE=$(mase))  ")
+
+            naive_mase = haskey(state.accuracy, "SNaive") ? state.accuracy["SNaive"].mase : Inf
+            beats = state.accuracy[state.best_model].mase < naive_mase
+            if use_color
+                if beats
+                    printstyled(io, "PASS"; color=:green, bold=true)
+                else
+                    printstyled(io, "FAIL"; color=:red, bold=true)
+                end
+            else
+                print(io, beats ? "PASS" : "FAIL")
+            end
+            println(io)
+        end
+        println(io, "  Evaluated: $(n_models) model$(n_models > 1 ? "s" : "") ($(join(sort(collect(keys(state.accuracy))), ", ")))")
+    end
+
+    # Forecast
+    if !isnothing(state.forecasts)
+        fc = state.forecasts
+        print(io, "  Forecast: $(fc.model), h=$(fc.horizon)")
+        if !isempty(fc.point_forecasts)
+            print(io, ", range [$(_round2(minimum(fc.point_forecasts))), $(_round2(maximum(fc.point_forecasts)))]")
+        end
+        println(io)
+    end
+
+    # Anomalies
+    if !isempty(state.anomalies)
+        print(io, "  Anomalies: $(length(state.anomalies)) detected")
+    end
+end
+
 # ── Compact show (single-line) ──────────────────────────────────────────────
 
 function Base.show(io::IO, m::AccuracyMetrics)

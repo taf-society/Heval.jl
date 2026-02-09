@@ -53,11 +53,11 @@ include("tools_panel.jl")
 # Core agent
 include("agent.jl")
 
-# Pretty display for user-facing types
-include("display.jl")
-
 # Ollama interface
 include("ollama.jl")
+
+# Pretty display for user-facing types (after all agent types are defined)
+include("display.jl")
 
 # Exports
 export HevalAgent, OllamaAgent
