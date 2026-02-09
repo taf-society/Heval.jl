@@ -763,6 +763,80 @@ using Durbyn
         @test sprint(print, qr_empty) == ""
     end
 
+    @testset "Display - HevalAgent" begin
+        # Construct agent manually (no API key needed for display tests)
+        config = Heval.LLMConfig(api_key="test", model="gpt-4o", base_url="https://api.openai.com/v1")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        # Compact show
+        s = sprint(show, agent)
+        @test occursin("HevalAgent", s)
+        @test occursin("gpt-4o", s)
+        @test occursin("no data loaded", s)
+
+        # Verbose show
+        s_v = sprint(show, MIME("text/plain"), agent)
+        @test occursin("HevalAgent", s_v)
+        @test occursin("gpt-4o", s_v)
+        @test occursin("7 registered", s_v)
+        @test occursin("none loaded", s_v)
+
+        # With data loaded
+        agent.state.values = Float64.(1:48)
+        agent.state.dates = [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:48]
+        agent.state.seasonal_period = 12
+        agent.state.horizon = 6
+        agent.state.best_model = "ETS"
+        agent.state.accuracy = Dict(
+            "ETS" => Heval.AccuracyMetrics(model="ETS", mase=0.74),
+            "SNaive" => Heval.AccuracyMetrics(model="SNaive", mase=1.0)
+        )
+        s2 = sprint(show, agent)
+        @test occursin("n=48", s2)
+        @test occursin("best=ETS", s2)
+
+        s2_v = sprint(show, MIME("text/plain"), agent)
+        @test occursin("48 obs", s2_v)
+        @test occursin("ETS", s2_v)
+        @test occursin("PASS", s2_v)
+    end
+
+    @testset "Display - OllamaAgent" begin
+        config = Heval.LLMConfig(api_key="ollama", model="llama3.1", base_url="http://localhost:11434")
+        ollama_config = Heval.OllamaConfig(model="llama3.1")
+        state = Heval.AgentState()
+        agent = Heval.OllamaAgent(config, ollama_config, state, Heval.Tool[],
+            Dict{String, Heval.Tool}(), Heval.build_system_prompt(), 3)
+        Heval.register_ollama_tools!(agent)
+
+        # Compact show
+        s = sprint(show, agent)
+        @test occursin("OllamaAgent", s)
+        @test occursin("llama3.1", s)
+        @test occursin("native", s)
+
+        # Verbose show
+        s_v = sprint(show, MIME("text/plain"), agent)
+        @test occursin("OllamaAgent", s_v)
+        @test occursin("llama3.1", s_v)
+        @test occursin("Native", s_v)
+        @test occursin("7 registered", s_v)
+        @test occursin("localhost", s_v)
+
+        # OpenAI-compat backend label
+        ollama_config2 = Heval.OllamaConfig(model="qwen2.5", use_openai_compat=true)
+        agent2 = Heval.OllamaAgent(config, ollama_config2, Heval.AgentState(), Heval.Tool[],
+            Dict{String, Heval.Tool}(), Heval.build_system_prompt(), 3)
+        s2 = sprint(show, agent2)
+        @test occursin("openai-compat", s2)
+
+        s2_v = sprint(show, MIME("text/plain"), agent2)
+        @test occursin("OpenAI-compatible", s2_v)
+    end
+
     @testset "System Prompt Generation" begin
         # Single series prompt
         prompt_single = Heval.build_system_prompt(; is_panel=false)
