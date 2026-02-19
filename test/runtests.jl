@@ -680,11 +680,11 @@ using Durbyn
         @test occursin("heval-fail", html_fail)
         @test occursin("FAIL", html_fail)
 
-        # HTML escaping
+        # HTML escaping — user content must be escaped, not rendered as raw HTML
         result_esc = Heval.AgentResult("<script>alert('xss')</script>", nothing,
             Dict{String, Heval.AccuracyMetrics}(), nothing, Heval.AnomalyResult[], nothing, false)
         html_esc = sprint(show, MIME("text/html"), result_esc)
-        @test !occursin("<script>", html_esc)
+        @test !occursin("<script>alert", html_esc)
         @test occursin("&lt;script&gt;", html_esc)
 
         # Minimal AgentResult HTML (nothing/empty fields)
@@ -745,10 +745,10 @@ using Durbyn
         @test occursin("Heval</h4>", html)
         @test occursin("strong upward trend", html)
 
-        # HTML escaping
+        # HTML escaping — user content must be escaped, not rendered as raw HTML
         qr_esc = Heval.QueryResult("<script>alert('xss')</script>")
         html_esc = sprint(show, MIME("text/html"), qr_esc)
-        @test !occursin("<script>", html_esc)
+        @test !occursin("<script>alert", html_esc)
         @test occursin("&lt;script&gt;", html_esc)
     end
 
@@ -842,16 +842,16 @@ using Durbyn
         prompt_single = Heval.build_system_prompt(; is_panel=false)
         @test occursin("Durbyn.jl", prompt_single)
         @test occursin("ARIMA", prompt_single)
-        @test occursin("ARAR", prompt_single)
-        @test occursin("Diffusion", prompt_single)
-        @test occursin("16 total", prompt_single)
+        @test occursin("SNaive", prompt_single)
+        @test occursin("Required workflow", prompt_single)
+        @test occursin("cross_validate", prompt_single)
         @test !occursin("panel_analyze", prompt_single)
 
         # Panel prompt
         prompt_panel = Heval.build_system_prompt(; is_panel=true)
         @test occursin("panel_analyze", prompt_panel)
         @test occursin("panel_fit", prompt_panel)
-        @test occursin("PANEL WORKFLOW", prompt_panel)
+        @test occursin("Panel workflow", prompt_panel)
     end
 
 end

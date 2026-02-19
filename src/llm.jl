@@ -20,14 +20,36 @@ end
 
 Convert Tool objects to OpenAI function calling format.
 """
+function _compact_json_schema(value)
+    if value isa Dict
+        compact = Dict{String, Any}()
+        for (k, v) in pairs(value)
+            key = String(k)
+            if key == "description"
+                continue
+            end
+            compact[key] = _compact_json_schema(v)
+        end
+        return compact
+    elseif value isa AbstractVector
+        return Any[_compact_json_schema(v) for v in value]
+    end
+    return value
+end
+
+function _compact_tool_description(desc::String)
+    compact = replace(strip(desc), r"\s+" => " ")
+    return length(compact) <= 140 ? compact : string(first(compact, 137), "...")
+end
+
 function tools_to_openai_format(tools::Vector{Tool})
     return [
         Dict(
             "type" => "function",
             "function" => Dict(
                 "name" => t.name,
-                "description" => t.description,
-                "parameters" => t.parameters
+                "description" => _compact_tool_description(t.description),
+                "parameters" => _compact_json_schema(t.parameters)
             )
         )
         for t in tools

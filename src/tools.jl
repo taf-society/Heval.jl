@@ -14,6 +14,26 @@ _to_int(x::Real) = Int(round(x))
 _to_int(x::AbstractString) = parse(Int, x)
 _to_int(x, default::Int) = try _to_int(x) catch; default end
 
+# Extract residuals from a Durbyn fitted model.
+# Durbyn.residuals() only dispatches on inner fit types (ArimaFit, etc.),
+# not on the wrapper types (FittedArima, FittedEts, ...) returned by Durbyn.fit().
+# We try the inner .fit.residuals field first, then fall back to forecast residuals.
+function _get_residuals(fitted_model)::Union{Vector{Float64}, Nothing}
+    # Path 1: direct field access on inner fit object
+    try
+        raw = fitted_model.fit.residuals
+        return Float64.(collect(skipmissing(raw)))
+    catch end
+    # Path 2: residuals from a forecast object
+    try
+        fc = Durbyn.forecast(fitted_model; h=1)
+        raw = fc.residuals
+        collected = collect(skipmissing(raw))
+        return isempty(collected) ? nothing : Float64.(collected)
+    catch end
+    return nothing
+end
+
 # Approximate p-value for ADF test by interpolation between critical values.
 # ADF is a left-tail test: more negative tau → stronger evidence against unit root.
 function _adf_approx_pvalue(tau_stat::Float64, cvals::Vector{Float64}, clevels::Vector{Float64})
@@ -119,7 +139,7 @@ function tool_analyze_features(state::AgentState, args::Dict)
             catch
                 # Fallback to ACF-based seasonality
                 acf_result = Durbyn.acf(y, m)
-                seasonal_acf_val = acf_result.acf[m + 1]  # acf array is 0-indexed (lag 0, 1, ..., m)
+                seasonal_acf_val = acf_result.values[m + 1]  # values array is 0-indexed (lag 0, 1, ..., m)
                 features.seasonal_acf = seasonal_acf_val
                 features.seasonality_strength = if seasonal_acf_val > 0.6
                     "strong"
@@ -386,15 +406,6 @@ function tool_cross_validate(state::AgentState, args::Dict)
         naive_mase = haskey(results, "SNaive") ? results["SNaive"].mase : Inf
         beats_naive = results[best].mase < naive_mase
 
-        # Format results table
-        table_lines = ["Model | MASE | RMSE | MAE | MAPE"]
-        push!(table_lines, repeat("-", 50))
-
-        for (name, metrics) in sort(collect(results), by=x -> x[2].mase)
-            marker = name == best ? " *" : ""
-            push!(table_lines, "$(name)$(marker) | $(metrics.mase) | $(metrics.rmse) | $(metrics.mae) | $(metrics.mape)%")
-        end
-
         return Dict(
             "status" => "success",
             "results" => Dict(k => Dict(
@@ -402,8 +413,7 @@ function tool_cross_validate(state::AgentState, args::Dict)
             ) for (k, v) in results),
             "best_model" => best,
             "best_mase" => results[best].mase,
-            "beats_snaive" => beats_naive,
-            "table" => join(table_lines, "\n")
+            "beats_snaive" => beats_naive
         )
     else
         return Dict("error" => "No valid results computed")
@@ -608,11 +618,7 @@ function tool_detect_anomalies(state::AgentState, args::Dict)
     resid = nothing
 
     if haskey(state.fitted_models, model_name)
-        try
-            fitted_model = state.fitted_models[model_name]
-            resid = Float64.(Durbyn.residuals(fitted_model))
-        catch
-        end
+        resid = _get_residuals(state.fitted_models[model_name])
     end
 
     # Fallback: fit the model now and get residuals
@@ -621,17 +627,18 @@ function tool_detect_anomalies(state::AgentState, args::Dict)
             dates = !isnothing(state.dates) ? state.dates :
                     [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n]
             fitted_model = durbyn_fit(model_name, dates, y, m)
-            resid = Float64.(Durbyn.residuals(fitted_model))
             state.fitted_models[model_name] = fitted_model
+            resid = _get_residuals(fitted_model)
         catch
-            # Last resort: use STL remainder as residuals
-            if n > 2m && m > 1
-                try
-                    stl_result = Durbyn.Stats.stl(y, m; s_window="periodic")
-                    resid = Float64.(stl_result.time_series.remainder)
-                catch
-                end
-            end
+        end
+    end
+
+    # Fallback: use STL remainder as residuals
+    if isnothing(resid) && n > 2m && m > 1
+        try
+            stl_result = Durbyn.Stats.stl(y, m; s_window="periodic")
+            resid = Float64.(stl_result.time_series.remainder)
+        catch
         end
     end
 
@@ -928,11 +935,11 @@ function tool_compare_models(state::AgentState, args::Dict)
                 end
 
                 # In-sample residual metrics
-                try
-                    resid = Float64.(Durbyn.residuals(fitted_model))
+                resid = _get_residuals(fitted_model)
+                if !isnothing(resid) && !isempty(resid)
                     info["rmse_insample"] = round(sqrt(mean(resid .^ 2)), digits=2)
                     info["mae_insample"] = round(mean(abs.(resid)), digits=2)
-                catch end
+                end
 
                 lock(compare_lock) do
                     state.fitted_models[model_name] = fitted_model

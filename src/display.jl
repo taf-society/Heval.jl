@@ -418,20 +418,31 @@ end
 
 const _HTML_STYLE = """
 <style>
-.heval-result { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 720px; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 8px 0; }
-.heval-result h3 { margin: 0 0 8px 0; color: #2c3e50; }
+/* Uses JupyterLab CSS variables (--jp-*) for automatic light/dark theme support.
+   Falls back to sensible defaults for non-Jupyter environments (VS Code, Colab, plain HTML). */
+.heval-result {
+  font-family: var(--jp-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif);
+  max-width: 720px;
+  border: 1px solid var(--jp-border-color2, rgba(128,128,128,0.3));
+  border-radius: 8px;
+  padding: 16px;
+  margin: 8px 0;
+  color: var(--jp-content-font-color1, inherit);
+}
+.heval-result h3 { margin: 0 0 8px 0; color: var(--jp-content-font-color0, inherit) !important; }
+.heval-result h4 { color: var(--jp-content-font-color0, inherit) !important; }
 .heval-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85em; }
-.heval-pass { background: #d4edda; color: #155724; }
-.heval-fail { background: #f8d7da; color: #721c24; }
+.heval-pass { background: #22863a; color: #fff !important; }
+.heval-fail { background: #cb2431; color: #fff !important; }
 .heval-section { margin-top: 12px; }
-.heval-section h4 { margin: 0 0 6px 0; color: #34495e; border-bottom: 1px solid #eee; padding-bottom: 4px; }
+.heval-section h4 { margin: 0 0 6px 0; border-bottom: 1px solid var(--jp-border-color2, rgba(128,128,128,0.25)); padding-bottom: 4px; }
 .heval-table { border-collapse: collapse; width: 100%; font-size: 0.9em; }
-.heval-table th { background: #f8f9fa; text-align: left; padding: 6px 10px; border: 1px solid #dee2e6; }
-.heval-table td { padding: 6px 10px; border: 1px solid #dee2e6; }
-.heval-table tr:nth-child(even) { background: #f8f9fa; }
-.heval-best { background: #EBF5FB !important; }
-.heval-narrative { max-height: 200px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 4px; font-size: 0.9em; white-space: pre-wrap; }
-.heval-kv { font-size: 0.9em; line-height: 1.6; }
+.heval-table th { background: rgba(128,128,128,0.12); text-align: left; padding: 6px 10px; border: 1px solid var(--jp-border-color2, rgba(128,128,128,0.25)); color: var(--jp-content-font-color0, inherit) !important; font-weight: 600; }
+.heval-table td { padding: 6px 10px; border: 1px solid var(--jp-border-color2, rgba(128,128,128,0.25)); color: var(--jp-content-font-color0, inherit) !important; }
+.heval-table tr:nth-child(even) { background: rgba(128,128,128,0.05); }
+.heval-best { background: rgba(30,120,220,0.10) !important; }
+.heval-narrative { max-height: 200px; overflow-y: auto; border: 1px solid var(--jp-border-color2, rgba(128,128,128,0.25)); padding: 10px; border-radius: 4px; font-size: 0.9em; white-space: pre-wrap; color: var(--jp-content-font-color0, inherit) !important; }
+.heval-kv { font-size: 0.9em; line-height: 1.6; color: var(--jp-content-font-color1, inherit) !important; }
 </style>"""
 
 function _html_escape(s::AbstractString)
@@ -479,7 +490,7 @@ function Base.show(io::IO, ::MIME"text/html", fc::ForecastOutput)
             println(io, "</tr>")
         end
         println(io, "</table>")
-        n > 6 && println(io, "<p style=\"font-size:0.85em;color:#666\">$(length(show_idxs)) of $(n) rows shown</p>")
+        n > 6 && println(io, "<p style=\"font-size:0.85em;opacity:0.7\">$(length(show_idxs)) of $(n) rows shown</p>")
     end
     println(io, "</div>")
 end
@@ -593,7 +604,7 @@ function Base.show(io::IO, ::MIME"text/html", r::AgentResult)
             println(io, "</tr>")
         end
         println(io, "</table>")
-        n > 6 && println(io, "<p style=\"font-size:0.85em;color:#666\">$(length(show_idxs)) of $(n) rows shown</p>")
+        n > 6 && println(io, "<p style=\"font-size:0.85em;opacity:0.7\">$(length(show_idxs)) of $(n) rows shown</p>")
         println(io, "</div>")
     end
 
@@ -695,7 +706,7 @@ end
 function Base.show(io::IO, ::MIME"text/html", qr::QueryResult)
     println(io, _HTML_STYLE)
     println(io, "<div class=\"heval-result\">")
-    println(io, "<h4 style=\"margin:0 0 6px 0; color:#2c3e50;\">Heval</h4>")
+    println(io, "<h4 style=\"margin:0 0 6px 0;\">Heval</h4>")
     println(io, "<div class=\"heval-narrative\">", _html_escape(qr.content), "</div>")
     println(io, "</div>")
 end

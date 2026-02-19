@@ -143,7 +143,7 @@ end
 
 function _build_diffusion_spec(target::Symbol; kwargs...)
     model_type = get(kwargs, :model, nothing)
-    term = Durbyn.DiffusionTerm(model_type, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    term = Durbyn.Grammar.diffusion(; model=model_type)
     formula = Durbyn.ModelFormula(target, Durbyn.AbstractTerm[term])
     return Durbyn.DiffusionSpec(formula)
 end
@@ -288,9 +288,9 @@ end
 # ── Stats Bridge ──────────────────────────────────────────────────────────
 # Expose Durbyn.Stats diagnostics through simple function calls.
 
-function compute_acf(y::AbstractVector, max_lag::Int)
-    result = Durbyn.acf(y, max_lag)
-    return result.acf
+function compute_acf(y::AbstractVector, m::Int, max_lag::Union{Int,Nothing}=nothing)
+    result = Durbyn.acf(y, m, max_lag)
+    return result.values
 end
 
 function compute_stl(y::AbstractVector, m::Int)

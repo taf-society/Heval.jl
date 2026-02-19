@@ -40,8 +40,8 @@ function tools_to_ollama_format(tools::Vector{Tool})
             "type" => "function",
             "function" => Dict(
                 "name" => t.name,
-                "description" => t.description,
-                "parameters" => t.parameters
+                "description" => _compact_tool_description(t.description),
+                "parameters" => _compact_json_schema(t.parameters)
             )
         )
         for t in tools
