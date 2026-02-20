@@ -164,6 +164,35 @@ function _show_agent_state(io::IO, state::AgentState)
     end
 end
 
+# ── Default Progress Callback ────────────────────────────────────────────────
+
+"""
+    default_progress_callback(event::AgentEvent)
+
+Print colored progress messages to `stderr`.
+
+Pass as `on_progress=default_progress_callback` to see live status during
+`analyze()` or `query()`.
+"""
+function default_progress_callback(event::AgentEvent)
+    io = stderr
+    prefix = "  [Round $(event.round)] "
+    if event.kind == llm_start
+        printstyled(io, prefix, "Calling LLM...\n"; color=:blue)
+    elseif event.kind == llm_done
+        printstyled(io, prefix, "LLM responded\n"; color=:blue)
+    elseif event.kind == tool_start
+        printstyled(io, prefix, "Running ", event.tool_name, "...\n"; color=:yellow)
+    elseif event.kind == tool_done
+        printstyled(io, prefix, "Completed ", event.tool_name, "\n"; color=:green)
+    elseif event.kind == retry
+        printstyled(io, prefix, event.message, "\n"; color=:red)
+    elseif event.kind == agent_done
+        printstyled(io, prefix, "Done\n"; color=:green, bold=true)
+    end
+    flush(io)
+end
+
 # ── Compact show (single-line) ──────────────────────────────────────────────
 
 function Base.show(io::IO, m::AccuracyMetrics)
