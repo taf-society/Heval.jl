@@ -115,7 +115,7 @@ println(result.output)
 
 ## Example 2: Follow-Up Questions
 
-After running an analysis, ask follow-up questions:
+After running an analysis, ask follow-up questions. The agent automatically uses the full conversation history from `analyze()`, so it understands context and references without re-running tools:
 
 ```julia
 answer = query(agent, "Why did you choose this model over ARIMA?")
@@ -123,7 +123,7 @@ answer = query(agent, "Why did you choose this model over ARIMA?")
 
 answer = query(agent, "What would happen if the trend continues?")
 
-answer = query(agent, "Are there any seasonal patterns I should worry about?")
+answer = query(agent, "Explain that for a non-technical manager")  # knows what "that" refers to
 ```
 
 `QueryResult` is string-interoperable:

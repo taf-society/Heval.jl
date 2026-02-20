@@ -97,7 +97,7 @@ data = (
 # Analyze — same interface as OpenAI agent
 result = analyze(agent, data; h=12, query="Forecast next year")
 
-# Follow-up questions
+# Follow-up questions (uses conversation history from analyze)
 answer = query(agent, "Why did you choose this model?")
 
 # Reset

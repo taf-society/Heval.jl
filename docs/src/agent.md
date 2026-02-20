@@ -121,13 +121,16 @@ result = analyze(agent, data;
 
 ### `query(agent, question)`
 
-Ask follow-up questions using the context from the last analysis.
+Ask follow-up questions using the full conversation history from `analyze()` or previous `query()` calls. The agent sees the entire prior conversation, so it understands references like "explain it for a manager" without re-running tools.
 
 ```julia
 answer = query(agent, "Why did you choose ETS over ARIMA?")
+answer = query(agent, "Explain that for a non-technical audience")  # knows what "that" refers to
 ```
 
-The agent has access to all tools during follow-up queries, so it can perform additional analyses if needed.
+If no conversation history is available (e.g., after a fresh `AgentState`), the agent falls back to building a context summary from the analysis state.
+
+The agent has access to all tools during follow-up queries, so it can perform additional analyses if needed (e.g., "try ARIMA instead").
 
 **Returns:** `QueryResult`
 
@@ -187,20 +190,21 @@ msg = "Answer: " * string(answer)    # concatenation works
 The agent maintains an `AgentState` across the analysis workflow:
 
 ```julia
-agent.state.dates             # Input dates
-agent.state.values            # Input values
-agent.state.seasonal_period   # m
-agent.state.horizon           # h
-agent.state.features          # SeriesFeatures (after analyze_features)
-agent.state.accuracy          # Dict of AccuracyMetrics (after cross_validate)
-agent.state.forecasts         # ForecastOutput (after generate_forecast)
-agent.state.anomalies         # Vector{AnomalyResult} (after detect_anomalies)
-agent.state.best_model        # Best model name
-agent.state.fitted_models     # Dict of Durbyn fitted model objects
-agent.state.panel             # PanelState (for multi-series)
+agent.state.dates                 # Input dates
+agent.state.values                # Input values
+agent.state.seasonal_period       # m
+agent.state.horizon               # h
+agent.state.features              # SeriesFeatures (after analyze_features)
+agent.state.accuracy              # Dict of AccuracyMetrics (after cross_validate)
+agent.state.forecasts             # ForecastOutput (after generate_forecast)
+agent.state.anomalies             # Vector{AnomalyResult} (after detect_anomalies)
+agent.state.best_model            # Best model name
+agent.state.fitted_models         # Dict of Durbyn fitted model objects
+agent.state.panel                 # PanelState (for multi-series)
+agent.state.conversation_history  # Vector{Message} — persisted for follow-up queries
 ```
 
-State is reset on each `analyze()` call or via `clear_history()`.
+State is reset on each `analyze()` call or via `clear_history()`. Conversation history is automatically saved after `analyze()` and each `query()` call, enabling context-aware follow-up questions.
 
 ---
 

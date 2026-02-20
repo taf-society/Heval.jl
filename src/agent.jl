@@ -339,12 +339,14 @@ function _emit(cb::ProgressCallback, event::AgentEvent)
 end
 
 """
-    _run_generic_agent_loop(state, tools, system_prompt, max_retries, user_prompt, call_fn, parse_fn, execute_fn; on_progress=nothing)
+    _run_generic_agent_loop(state, tools, system_prompt, max_retries, user_prompt, call_fn, parse_fn, execute_fn; on_progress=nothing, stream=nothing, stream_fn=nothing)
 
 Shared agent loop used by both HevalAgent and OllamaAgent.
 `call_fn(messages, tools)` → raw response
 `parse_fn(response)` → Message
 `execute_fn(name, args)` → result Dict
+
+Persists the full message history to `state.conversation_history` after completion.
 """
 function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
                                   system_prompt::String, max_retries::Int,
@@ -430,9 +432,12 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
 end
 
 """
-    _generic_query(state, tools, system_prompt, question, call_fn, parse_fn, execute_fn; on_progress=nothing)
+    _generic_query(state, tools, system_prompt, question, call_fn, parse_fn, execute_fn; on_progress=nothing, stream=nothing, stream_fn=nothing)
 
 Shared query loop used by both HevalAgent and OllamaAgent.
+
+Uses `state.conversation_history` as context when available, otherwise builds a fresh
+context summary from state. Persists the updated history after completion.
 """
 function _generic_query(state::AgentState, tools::Vector{Tool},
                         system_prompt::String, question::String,

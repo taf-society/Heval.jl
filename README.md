@@ -161,11 +161,11 @@ for a in result.anomalies
     println("Anomaly at $(a.date): value=$(a.value), z-score=$(round(a.z_score, digits=2))")
 end
 
-# 5. Ask follow-up questions
+# 5. Ask follow-up questions (conversation history is preserved automatically)
 answer = query(agent, "What drives the seasonal pattern?")
 println(answer)
 
-answer = query(agent, "How confident are you in the forecast?")
+answer = query(agent, "Explain that for a non-technical audience")  # knows what "that" refers to
 println(answer)
 ```
 
