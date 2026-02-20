@@ -204,6 +204,89 @@ function parse_ollama_response(config::OllamaConfig, response)
     return Message("assistant", content, tool_calls, nothing)
 end
 
+"""
+    _parse_ollama_stream(io, on_token) -> String
+
+Parse an Ollama native JSON-lines stream, calling `on_token(delta)` for each
+content chunk. Returns the accumulated full text.
+"""
+function _parse_ollama_stream(io::IO, on_token::Function)
+    accumulated = IOBuffer()
+    while !eof(io)
+        line = readline(io)
+        isempty(line) && continue
+        try
+            chunk = JSON3.read(line)
+            content = get(get(chunk, "message", Dict()), "content", "")
+            if !isempty(content)
+                write(accumulated, content)
+                on_token(content)
+            end
+            get(chunk, "done", false) && break
+        catch
+            # Skip malformed lines
+        end
+    end
+    return String(take!(accumulated))
+end
+
+"""
+    call_ollama_streaming(config, messages, on_token) -> String
+
+Make a streaming API call to Ollama (no tools). Calls `on_token(delta)` for
+each text chunk. Returns the accumulated full text.
+
+Uses the native `/api/chat` endpoint with `stream: true` when not in
+OpenAI-compat mode, otherwise delegates to `call_llm_streaming`.
+
+Falls back to non-streaming `call_ollama` on any streaming error.
+"""
+function call_ollama_streaming(config::OllamaConfig, messages::Vector{Message},
+                                on_token::Function)
+    if config.use_openai_compat
+        llm_config = LLMConfig(
+            api_key = "ollama",
+            model = config.model,
+            base_url = "$(config.host)/v1",
+            max_tokens = config.max_tokens,
+            temperature = config.temperature
+        )
+        return call_llm_streaming(llm_config, messages, on_token)
+    end
+
+    messages_spec = messages_to_ollama_format(messages)
+
+    body = Dict{String, Any}(
+        "model" => config.model,
+        "messages" => messages_spec,
+        "stream" => true,
+        "options" => Dict(
+            "temperature" => config.temperature,
+            "num_predict" => config.max_tokens
+        )
+    )
+
+    headers = ["Content-Type" => "application/json"]
+
+    try
+        accumulated = ""
+        HTTP.open("POST", "$(config.host)/api/chat", headers;
+                  body = JSON3.write(body), status_exception = true) do io
+            accumulated = _parse_ollama_stream(io, on_token)
+        end
+        return accumulated
+    catch e
+        @warn "Streaming failed, falling back to non-streaming call" exception=(e, catch_backtrace())
+        response = call_ollama(config, messages, Tool[])
+        msg = parse_ollama_response(config, response)
+        text = something(msg.content, "")
+        if !isempty(text)
+            on_token(text)
+        end
+        return text
+    end
+end
+
 # ============================================================================
 # Ollama HevalAgent Constructor
 # ============================================================================
@@ -312,7 +395,77 @@ function execute_ollama_tool(agent::OllamaAgent, name::String, args::Dict)
 end
 
 """
-    analyze(agent::OllamaAgent, data; h=nothing, m=nothing, query=nothing, groupby=nothing, ...)
+    _call_llm_for_interpretation(agent::OllamaAgent, prompt::String) -> String
+
+Make a single Ollama LLM call for interpretation (no tools).
+"""
+function _call_llm_for_interpretation(agent::OllamaAgent, prompt::String)
+    messages = [
+        Message("system", "You are Heval, a concise forecasting assistant."),
+        Message("user", prompt)
+    ]
+    response = call_ollama(agent.ollama_config, messages, Tool[])
+    assistant_msg = parse_ollama_response(agent.ollama_config, response)
+    return something(assistant_msg.content, "")
+end
+
+"""
+    _run_fast_pipeline(agent::OllamaAgent, query; max_retries=2, on_progress=nothing) -> AgentResult
+
+Run the deterministic pipeline + one Ollama LLM call for interpretation.
+"""
+function _run_fast_pipeline(agent::OllamaAgent, query::Union{String, Nothing};
+                             max_retries::Int=2,
+                             on_progress::ProgressCallback=nothing,
+                             stream::Union{IO, Nothing}=nothing)
+    state = agent.state
+    _run_deterministic_steps!(state; max_retries=max_retries, on_progress=on_progress)
+
+    prompt = _build_interpretation_prompt(state; query=query)
+    output = try
+        _emit(on_progress, AgentEvent(llm_start, 1; message="LLM interpretation"))
+        result = if !isnothing(stream)
+            messages = [
+                Message("system", "You are Heval, a concise forecasting assistant."),
+                Message("user", prompt)
+            ]
+            text = call_ollama_streaming(agent.ollama_config, messages,
+                token -> print(stream, token))
+            flush(stream)
+            println(stream)
+            text
+        else
+            _call_llm_for_interpretation(agent, prompt)
+        end
+        _emit(on_progress, AgentEvent(llm_done, 1; message="Interpretation done"))
+        result
+    catch e
+        @warn "LLM interpretation failed, using programmatic summary" exception=(e, catch_backtrace())
+        _build_results_summary(state; query=query)
+    end
+
+    _emit(on_progress, AgentEvent(agent_done, 0; message="Fast pipeline finished"))
+
+    # Persist conversation for follow-up queries
+    state.conversation_history = [
+        Message("system", "You are Heval, a concise forecasting assistant."),
+        Message("user", prompt),
+        Message("assistant", output)
+    ]
+
+    return AgentResult(
+        output,
+        state.features,
+        state.accuracy,
+        state.forecasts,
+        state.anomalies,
+        state.best_model,
+        _compute_beats_baseline(state)
+    )
+end
+
+"""
+    analyze(agent::OllamaAgent, data; h=nothing, m=nothing, query=nothing, mode=:fast, groupby=nothing, ...)
 
 Run the full forecasting workflow using Ollama.
 
@@ -321,6 +474,10 @@ Run the full forecasting workflow using Ollama.
 - `h::Int` - Forecast horizon (default: 2*m)
 - `m::Int` - Seasonal period (default: 12)
 - `query::String` - Natural language instructions (optional)
+- `mode::Symbol` - Pipeline mode (default: `:fast`)
+  - `:fast` — deterministic pipeline + 1 LLM call for interpretation
+  - `:local` — deterministic pipeline only, no LLM calls
+  - `:agentic` — full LLM-driven agent loop
 - `groupby` - Column(s) for panel data grouping (optional)
 - `date` - Date column name for panel data (default: :date)
 - `target` - Target column name for panel data (default: :value)
@@ -331,10 +488,18 @@ function analyze(
     h::Union{Int, Nothing} = nothing,
     m::Union{Int, Nothing} = nothing,
     query::Union{String, Nothing} = nothing,
+    mode::Symbol = :fast,
     groupby::Union{Vector{Symbol}, Symbol, Nothing} = nothing,
     date::Union{Symbol, Nothing} = nothing,
-    target::Union{Symbol, Nothing} = nothing
+    target::Union{Symbol, Nothing} = nothing,
+    on_progress::ProgressCallback = nothing,
+    stream::Union{IO, Nothing} = nothing
 )
+    # Validate mode
+    if !(mode in (:fast, :local, :agentic))
+        error("Unknown mode: :$mode. Use :fast, :local, or :agentic.")
+    end
+
     # Set defaults
     m = isnothing(m) ? 12 : m
     h = isnothing(h) ? 2 * m : h
@@ -343,10 +508,15 @@ function analyze(
     is_panel = !isnothing(groupby)
 
     if is_panel
+        if mode != :agentic
+            @warn "Panel data requires :agentic mode; ignoring mode=:$mode"
+        end
         return _analyze_ollama_panel(agent, data; h=h, m=m, query=query,
                                       groupby=groupby isa Symbol ? [groupby] : groupby,
                                       date_col=something(date, :date),
-                                      target_col=something(target, :value))
+                                      target_col=something(target, :value),
+                                      on_progress=on_progress,
+                                      stream=stream)
     end
 
     # ── Single-series path ─────────────────────────────────────────────────
@@ -363,8 +533,19 @@ function analyze(
     agent.system_prompt = build_system_prompt(; is_panel=false)
     register_ollama_tools!(agent)
 
-    # Build user prompt
-    data_summary = """
+    # Route based on mode
+    if mode == :local
+        return _run_local_pipeline(agent.state;
+                                    max_retries=agent.max_retries,
+                                    on_progress=on_progress)
+    elseif mode == :fast
+        return _run_fast_pipeline(agent, query;
+                                   max_retries=agent.max_retries,
+                                   on_progress=on_progress,
+                                   stream=stream)
+    else  # :agentic
+        # Build user prompt
+        data_summary = """
 Data summary:
 - Length: $(length(values)) observations
 - Date range: $(isnothing(dates) ? "not provided" : "$(dates[1]) to $(dates[end])")
@@ -376,7 +557,7 @@ Data summary:
 - Forecast horizon (h): $h
 """
 
-    user_prompt = """
+        user_prompt = """
 $data_summary
 
 $(isnothing(query) ? "Please analyze this time series and generate forecasts." : "User request: $query")
@@ -384,14 +565,17 @@ $(isnothing(query) ? "Please analyze this time series and generate forecasts." :
 Follow the workflow: analyze_features → cross_validate → generate_forecast → detect_anomalies
 """
 
-    return _run_ollama_agent_loop(agent, user_prompt)
+        return _run_ollama_agent_loop(agent, user_prompt; on_progress=on_progress, stream=stream)
+    end
 end
 
 function _analyze_ollama_panel(agent::OllamaAgent, data;
                                 h::Int, m::Int,
                                 query::Union{String, Nothing},
                                 groupby::Vector{Symbol},
-                                date_col::Symbol, target_col::Symbol)
+                                date_col::Symbol, target_col::Symbol,
+                                on_progress::ProgressCallback=nothing,
+                                stream::Union{IO, Nothing}=nothing)
     # Initialize state with panel
     agent.state = AgentState()
     agent.state.seasonal_period = m
@@ -443,16 +627,20 @@ $(isnothing(query) ? "Please analyze this panel data and generate forecasts." : 
 For panel data, use panel_analyze → analyze_features → cross_validate or panel_fit → detect_anomalies
 """
 
-    return _run_ollama_agent_loop(agent, user_prompt)
+    return _run_ollama_agent_loop(agent, user_prompt; on_progress=on_progress, stream=stream)
 end
 
-function _run_ollama_agent_loop(agent::OllamaAgent, user_prompt::String)
+function _run_ollama_agent_loop(agent::OllamaAgent, user_prompt::String;
+                                 on_progress::ProgressCallback=nothing,
+                                 stream::Union{IO, Nothing}=nothing)
     call_fn = (msgs, tools) -> call_ollama(agent.ollama_config, msgs, tools)
     parse_fn = resp -> parse_ollama_response(agent.ollama_config, resp)
     execute_fn = (name, args) -> execute_ollama_tool(agent, name, args)
     return _run_generic_agent_loop(agent.state, agent.tools, agent.system_prompt,
                                     agent.max_retries, user_prompt,
-                                    call_fn, parse_fn, execute_fn)
+                                    call_fn, parse_fn, execute_fn;
+                                    on_progress=on_progress,
+                                    stream=stream)
 end
 
 function register_ollama_panel_tools!(agent::OllamaAgent)
@@ -469,12 +657,16 @@ end
 
 Ask a follow-up question about the analysis using Ollama.
 """
-function query(agent::OllamaAgent, question::String)
+function query(agent::OllamaAgent, question::String;
+               on_progress::ProgressCallback=nothing,
+               stream::Union{IO, Nothing}=nothing)
     call_fn = (msgs, tools) -> call_ollama(agent.ollama_config, msgs, tools)
     parse_fn = resp -> parse_ollama_response(agent.ollama_config, resp)
     execute_fn = (name, args) -> execute_ollama_tool(agent, name, args)
     return _generic_query(agent.state, agent.tools, agent.system_prompt, question,
-                          call_fn, parse_fn, execute_fn)
+                          call_fn, parse_fn, execute_fn;
+                          on_progress=on_progress,
+                          stream=stream)
 end
 
 """

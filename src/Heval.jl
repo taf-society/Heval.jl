@@ -63,6 +63,7 @@ include("display.jl")
 export HevalAgent, OllamaAgent
 export analyze, query, clear_history
 export AgentResult, QueryResult, ForecastOutput, PanelState
+export AgentEvent, AgentEventKind, ProgressCallback, default_progress_callback
 export OllamaConfig
 export list_ollama_models, check_ollama_connection
 export AVAILABLE_MODELS

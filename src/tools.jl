@@ -257,6 +257,76 @@ function generate_recommendations(features::SeriesFeatures)
 end
 
 # ============================================================================
+# Model Selection for Fast Pipeline
+# ============================================================================
+
+"""
+    _select_candidate_models(features::SeriesFeatures) -> Vector{String}
+
+Select 4-6 candidate models based on series features for the fast pipeline.
+Always includes SNaive as baseline.
+"""
+function _select_candidate_models(features::SeriesFeatures)
+    models = String["SNaive"]
+
+    if features.is_intermittent
+        push!(models, "Croston", "SES")
+    end
+
+    has_seasonality = features.seasonality_strength in ("strong", "moderate")
+    has_trend = features.trend_strength in ("strong", "moderate")
+
+    if has_seasonality
+        push!(models, "ETS", "HoltWinters")
+        if has_trend
+            push!(models, "ARIMA")
+        else
+            push!(models, "BATS")
+        end
+    else
+        push!(models, "SES", "Theta")
+        if has_trend
+            push!(models, "Holt", "ARIMA")
+        else
+            push!(models, "ARAR")
+        end
+    end
+
+    # Deduplicate while preserving order
+    seen = Set{String}()
+    unique_models = String[]
+    for m in models
+        if !(m in seen)
+            push!(seen, m)
+            push!(unique_models, m)
+        end
+    end
+
+    return unique_models
+end
+
+"""
+    _expand_candidate_models(already_tried::Vector{String}, features::SeriesFeatures) -> Vector{String}
+
+Return up to 4 untried models for retry when the best model doesn't beat SNaive.
+"""
+function _expand_candidate_models(already_tried::Vector{String}, features::SeriesFeatures)
+    # Priority order for expansion
+    expansion = String["ARIMA", "ETS", "Theta", "ARAR", "Holt", "BATS", "TBATS",
+                       "HoltWinters", "Croston", "ARARMA", "Diffusion"]
+
+    tried = Set(already_tried)
+    candidates = String[]
+    for m in expansion
+        if !(m in tried) && length(candidates) < 4
+            push!(candidates, m)
+        end
+    end
+
+    return candidates
+end
+
+# ============================================================================
 # Tool: cross_validate
 # ============================================================================
 

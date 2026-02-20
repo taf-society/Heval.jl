@@ -189,3 +189,49 @@ Result returned from query(). Wraps a plain string with pretty display.
 struct QueryResult
     content::String
 end
+
+# ============================================================================
+# Progress / Streaming Events
+# ============================================================================
+
+"""
+    AgentEventKind
+
+Kind of event emitted during an agent loop.
+"""
+@enum AgentEventKind begin
+    llm_start      # LLM call starting
+    llm_done       # LLM call completed
+    tool_start     # Tool execution starting
+    tool_done      # Tool execution completed
+    retry          # Retry loop triggered
+    agent_done     # Agent loop finished
+end
+
+"""
+    AgentEvent
+
+A progress event emitted during the agent loop.
+
+# Fields
+- `kind::AgentEventKind` — event type
+- `round::Int` — current tool round
+- `tool_name::String` — tool name (empty for non-tool events)
+- `message::String` — human-readable description
+"""
+struct AgentEvent
+    kind::AgentEventKind
+    round::Int
+    tool_name::String
+    message::String
+end
+
+AgentEvent(kind::AgentEventKind, round::Int; tool_name::String="", message::String="") =
+    AgentEvent(kind, round, tool_name, message)
+
+"""
+    ProgressCallback
+
+Type alias for the optional progress callback: either a `Function` or `nothing`.
+"""
+const ProgressCallback = Union{Function, Nothing}

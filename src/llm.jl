@@ -161,6 +161,78 @@ function parse_llm_response(response)
 end
 
 """
+    _parse_sse_stream(io, on_token) -> String
+
+Parse an OpenAI SSE stream, calling `on_token(delta)` for each content chunk.
+Returns the accumulated full text.
+"""
+function _parse_sse_stream(io::IO, on_token::Function)
+    accumulated = IOBuffer()
+    while !eof(io)
+        line = readline(io)
+        isempty(line) && continue
+        startswith(line, "data: ") || continue
+        payload = line[7:end]
+        payload == "[DONE]" && break
+        try
+            chunk = JSON3.read(payload)
+            delta = get(chunk["choices"][1]["delta"], "content", nothing)
+            if !isnothing(delta) && !isempty(delta)
+                write(accumulated, delta)
+                on_token(delta)
+            end
+        catch
+            # Skip malformed chunks
+        end
+    end
+    return String(take!(accumulated))
+end
+
+"""
+    call_llm_streaming(config, messages, on_token) -> String
+
+Make a streaming API call to the LLM (no tools). Calls `on_token(delta)` for
+each text chunk. Returns the accumulated full text.
+
+Falls back to non-streaming `call_llm` on any streaming error.
+"""
+function call_llm_streaming(config::LLMConfig, messages::Vector{Message},
+                             on_token::Function)
+    messages_spec = messages_to_openai_format(messages)
+
+    body = Dict(
+        "model" => config.model,
+        "messages" => messages_spec,
+        "max_tokens" => config.max_tokens,
+        "temperature" => config.temperature,
+        "stream" => true
+    )
+
+    headers = [
+        "Authorization" => "Bearer $(config.api_key)",
+        "Content-Type" => "application/json"
+    ]
+
+    try
+        accumulated = ""
+        HTTP.open("POST", "$(config.base_url)/chat/completions", headers;
+                  body = JSON3.write(body), status_exception = true) do io
+            accumulated = _parse_sse_stream(io, on_token)
+        end
+        return accumulated
+    catch e
+        @warn "Streaming failed, falling back to non-streaming call" exception=(e, catch_backtrace())
+        response = call_llm(config, messages, Tool[])
+        msg = parse_llm_response(response)
+        text = something(msg.content, "")
+        if !isempty(text)
+            on_token(text)
+        end
+        return text
+    end
+end
+
+"""
     format_tool_result(tool_call_id, result)
 
 Create a tool result message.

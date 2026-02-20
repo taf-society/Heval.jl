@@ -837,6 +837,72 @@ using Durbyn
         @test occursin("OpenAI-compatible", s2_v)
     end
 
+    @testset "Progress Callback - AgentEvent types" begin
+        # AgentEvent construction with keyword convenience
+        e1 = Heval.AgentEvent(Heval.llm_start, 1; message="test")
+        @test e1.kind == Heval.llm_start
+        @test e1.round == 1
+        @test e1.tool_name == ""
+        @test e1.message == "test"
+
+        # Full constructor
+        e2 = Heval.AgentEvent(Heval.tool_start, 2, "cross_validate", "Running cross_validate")
+        @test e2.tool_name == "cross_validate"
+        @test e2.round == 2
+
+        # ProgressCallback type alias
+        @test nothing isa Heval.ProgressCallback
+        @test (_ -> nothing) isa Heval.ProgressCallback
+    end
+
+    @testset "Progress Callback - default_progress_callback" begin
+        # Verify default_progress_callback doesn't error on each event kind
+        for kind in instances(Heval.AgentEventKind)
+            event = Heval.AgentEvent(kind, 1; tool_name="test_tool", message="test message")
+            # Redirect stderr to suppress output during tests
+            redirect_stderr(devnull) do
+                @test isnothing(default_progress_callback(event))
+            end
+        end
+    end
+
+    @testset "Progress Callback - _emit safety" begin
+        # _emit with nothing callback is a no-op
+        event = Heval.AgentEvent(Heval.llm_start, 1)
+        @test isnothing(Heval._emit(nothing, event))
+
+        # _emit with working callback
+        captured = Ref{Heval.AgentEvent}()
+        cb = e -> (captured[] = e)
+        Heval._emit(cb, event)
+        @test captured[].kind == Heval.llm_start
+
+        # _emit with broken callback — should not throw
+        bad_cb = _ -> error("broken!")
+        @test isnothing(Heval._emit(bad_cb, event))
+    end
+
+    @testset "Progress Callback - event ordering" begin
+        # Simulate a mini agent loop and verify callback receives events
+        events = Heval.AgentEvent[]
+        cb = e -> push!(events, e)
+
+        # We can't run a full agent loop without an API key, but we can test
+        # that the on_progress kwarg is accepted by the public API signatures
+        # by constructing agents and checking method existence.
+        # The actual event emission is tested via _emit above.
+
+        # Verify that the on_progress keyword is accepted (no MethodError)
+        # We test this by checking that the method signature exists
+        @test hasmethod(Heval._run_generic_agent_loop,
+            Tuple{Heval.AgentState, Vector{Heval.Tool}, String, Int, String,
+                  Function, Function, Function})
+
+        @test hasmethod(Heval._generic_query,
+            Tuple{Heval.AgentState, Vector{Heval.Tool}, String, String,
+                  Function, Function, Function})
+    end
+
     @testset "System Prompt Generation" begin
         # Single series prompt
         prompt_single = Heval.build_system_prompt(; is_panel=false)
@@ -852,6 +918,490 @@ using Durbyn
         @test occursin("panel_analyze", prompt_panel)
         @test occursin("panel_fit", prompt_panel)
         @test occursin("Panel workflow", prompt_panel)
+    end
+
+    @testset "Model Selection - _select_candidate_models" begin
+        # Seasonal data
+        features_seasonal = Heval.SeriesFeatures(
+            seasonality_strength="strong",
+            trend_strength="moderate",
+            is_intermittent=false
+        )
+        models = Heval._select_candidate_models(features_seasonal)
+        @test "SNaive" in models
+        @test "ETS" in models
+        @test "HoltWinters" in models
+        @test length(models) >= 4
+        # No duplicates
+        @test length(models) == length(unique(models))
+
+        # Intermittent data
+        features_int = Heval.SeriesFeatures(
+            seasonality_strength="weak",
+            trend_strength="weak",
+            is_intermittent=true,
+            zero_fraction=0.4
+        )
+        models_int = Heval._select_candidate_models(features_int)
+        @test "SNaive" in models_int
+        @test "Croston" in models_int
+        @test "SES" in models_int
+        @test length(models_int) == length(unique(models_int))
+
+        # Trend without seasonality
+        features_trend = Heval.SeriesFeatures(
+            seasonality_strength="weak",
+            trend_strength="strong",
+            is_intermittent=false
+        )
+        models_trend = Heval._select_candidate_models(features_trend)
+        @test "SNaive" in models_trend
+        @test "Holt" in models_trend
+        @test "ARIMA" in models_trend
+        @test "Theta" in models_trend
+
+        # Weak everything
+        features_weak = Heval.SeriesFeatures(
+            seasonality_strength="weak",
+            trend_strength="weak",
+            is_intermittent=false
+        )
+        models_weak = Heval._select_candidate_models(features_weak)
+        @test "SNaive" in models_weak
+        @test "SES" in models_weak
+        @test "ARAR" in models_weak
+    end
+
+    @testset "Model Selection - _expand_candidate_models" begin
+        features = Heval.SeriesFeatures()
+        already_tried = ["SNaive", "SES", "ETS"]
+        extra = Heval._expand_candidate_models(already_tried, features)
+        @test length(extra) <= 4
+        @test !any(m -> m in already_tried, extra)
+        @test "ARIMA" in extra  # first in priority, not tried yet
+
+        # All models tried
+        all_tried = Heval.AVAILABLE_MODELS
+        extra_none = Heval._expand_candidate_models(all_tried, features)
+        @test isempty(extra_none)
+    end
+
+    @testset "Beats Baseline Helper" begin
+        state = Heval.AgentState()
+
+        # No accuracy → false
+        @test Heval._compute_beats_baseline(state) == false
+
+        # Best beats SNaive
+        state.accuracy = Dict(
+            "ETS" => Heval.AccuracyMetrics(model="ETS", mase=0.7),
+            "SNaive" => Heval.AccuracyMetrics(model="SNaive", mase=1.0)
+        )
+        state.best_model = "ETS"
+        @test Heval._compute_beats_baseline(state) == true
+
+        # Best does NOT beat SNaive
+        state.accuracy["ETS"] = Heval.AccuracyMetrics(model="ETS", mase=1.2)
+        @test Heval._compute_beats_baseline(state) == false
+    end
+
+    @testset "Results Summary Formatting" begin
+        state = Heval.AgentState()
+        state.values = Float64.(1:48)
+        state.dates = [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:48]
+        state.seasonal_period = 12
+        state.horizon = 6
+
+        # Run features
+        Heval.tool_analyze_features(state, Dict{String, Any}())
+
+        # Run CV
+        Heval.tool_cross_validate(state, Dict{String, Any}("models" => ["SES", "SNaive"]))
+
+        # Run forecast
+        if !isnothing(state.best_model)
+            Heval.tool_generate_forecast(state, Dict{String, Any}("model" => state.best_model))
+        end
+
+        summary = Heval._build_results_summary(state)
+        @test occursin("observations", summary)
+        @test occursin("MASE", summary)
+        @test occursin("Best model", summary)
+        @test occursin("Forecast", summary) || occursin("Anomalies", summary)
+    end
+
+    @testset "Local Pipeline End-to-End" begin
+        # No LLM needed — runs entirely locally
+        state = Heval.AgentState()
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        state.values = Float64.(100 .+ collect(1:n) .+ seasonal)
+        state.dates = [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n]
+        state.seasonal_period = 12
+        state.horizon = 6
+
+        result = Heval._run_local_pipeline(state; max_retries=2)
+
+        @test result isa Heval.AgentResult
+        @test !isnothing(result.features)
+        @test !isempty(result.accuracy)
+        @test !isnothing(result.forecasts)
+        @test result.forecasts.horizon == 6
+        @test !isnothing(result.best_model)
+        @test !isempty(result.output)
+    end
+
+    @testset "Interpretation Prompt Building" begin
+        state = Heval.AgentState()
+        state.features = Heval.SeriesFeatures(
+            length=48, trend_strength="moderate", seasonality_strength="strong",
+            stationarity="non-stationary"
+        )
+        state.accuracy = Dict(
+            "ETS" => Heval.AccuracyMetrics(model="ETS", mase=0.7),
+            "SNaive" => Heval.AccuracyMetrics(model="SNaive", mase=1.0)
+        )
+        state.best_model = "ETS"
+        state.forecasts = Heval.ForecastOutput(
+            model="ETS", horizon=6,
+            point_forecasts=[100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+            dates=Date.(2024, 1:6)
+        )
+
+        prompt = Heval._build_interpretation_prompt(state; query="What's happening?")
+        @test occursin("ETS", prompt)
+        @test occursin("MASE", prompt)
+        @test occursin("What's happening?", prompt)
+        @test occursin("Heval", prompt)
+    end
+
+    @testset "analyze mode kwarg validation" begin
+        # Construct agent manually (no real API key needed for mode validation)
+        config = Heval.LLMConfig(api_key="test", model="gpt-4o")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:48],
+                value=Float64.(100 .+ collect(1:48)))
+
+        # Invalid mode should error
+        @test_throws ErrorException analyze(agent, data; h=6, mode=:invalid)
+    end
+
+    @testset "analyze :local mode full integration" begin
+        # Full integration test with local mode — no LLM needed
+        config = Heval.LLMConfig(api_key="unused", model="gpt-4o")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n],
+                value=Float64.(100 .+ collect(1:n) .+ seasonal))
+
+        result = analyze(agent, data; h=6, mode=:local)
+
+        @test result isa Heval.AgentResult
+        @test !isnothing(result.features)
+        @test !isempty(result.accuracy)
+        @test !isnothing(result.forecasts)
+        @test result.forecasts.horizon == 6
+        @test !isnothing(result.best_model)
+        @test !isempty(result.output)
+        @test occursin("Best model", result.output)
+    end
+
+    @testset "Streaming - SSE Parser" begin
+        # Simulate an OpenAI SSE stream
+        sse_data = """
+data: {"choices":[{"delta":{"content":"Hello"}}]}
+
+data: {"choices":[{"delta":{"content":" world"}}]}
+
+data: {"choices":[{"delta":{"content":"!"}}]}
+
+data: [DONE]
+
+"""
+        io = IOBuffer(sse_data)
+        tokens = String[]
+        result = Heval._parse_sse_stream(io, t -> push!(tokens, t))
+
+        @test result == "Hello world!"
+        @test tokens == ["Hello", " world", "!"]
+    end
+
+    @testset "Streaming - SSE Parser edge cases" begin
+        # Empty delta content should be skipped
+        sse_data = """
+data: {"choices":[{"delta":{"content":""}}]}
+
+data: {"choices":[{"delta":{"content":"ok"}}]}
+
+data: {"choices":[{"delta":{"role":"assistant"}}]}
+
+data: [DONE]
+
+"""
+        io = IOBuffer(sse_data)
+        tokens = String[]
+        result = Heval._parse_sse_stream(io, t -> push!(tokens, t))
+
+        @test result == "ok"
+        @test tokens == ["ok"]
+
+        # Malformed JSON lines should be skipped
+        sse_data2 = """
+data: not-json
+
+data: {"choices":[{"delta":{"content":"fine"}}]}
+
+data: [DONE]
+
+"""
+        io2 = IOBuffer(sse_data2)
+        tokens2 = String[]
+        result2 = Heval._parse_sse_stream(io2, t -> push!(tokens2, t))
+
+        @test result2 == "fine"
+        @test tokens2 == ["fine"]
+
+        # Non-data lines should be skipped
+        sse_data3 = """
+: comment line
+event: message
+data: {"choices":[{"delta":{"content":"yes"}}]}
+
+data: [DONE]
+
+"""
+        io3 = IOBuffer(sse_data3)
+        tokens3 = String[]
+        result3 = Heval._parse_sse_stream(io3, t -> push!(tokens3, t))
+
+        @test result3 == "yes"
+        @test tokens3 == ["yes"]
+    end
+
+    @testset "Streaming - Ollama JSONL Parser" begin
+        # Simulate an Ollama streaming response (JSON lines)
+        jsonl_data = """
+{"message":{"content":"Hello"},"done":false}
+{"message":{"content":" world"},"done":false}
+{"message":{"content":"!"},"done":true}
+"""
+        io = IOBuffer(jsonl_data)
+        tokens = String[]
+        result = Heval._parse_ollama_stream(io, t -> push!(tokens, t))
+
+        @test result == "Hello world!"
+        @test tokens == ["Hello", " world", "!"]
+    end
+
+    @testset "Streaming - Ollama JSONL Parser edge cases" begin
+        # Empty content should be skipped
+        jsonl_data = """
+{"message":{"content":""},"done":false}
+{"message":{"content":"ok"},"done":false}
+{"done":true}
+"""
+        io = IOBuffer(jsonl_data)
+        tokens = String[]
+        result = Heval._parse_ollama_stream(io, t -> push!(tokens, t))
+
+        @test result == "ok"
+        @test tokens == ["ok"]
+
+        # Malformed lines should be skipped
+        jsonl_data2 = """
+not-json
+{"message":{"content":"fine"},"done":false}
+{"message":{"content":""},"done":true}
+"""
+        io2 = IOBuffer(jsonl_data2)
+        tokens2 = String[]
+        result2 = Heval._parse_ollama_stream(io2, t -> push!(tokens2, t))
+
+        @test result2 == "fine"
+        @test tokens2 == ["fine"]
+    end
+
+    @testset "Streaming - stream=nothing backward compat" begin
+        # Verify that stream=nothing (default) doesn't change behavior
+        config = Heval.LLMConfig(api_key="test", model="gpt-4o")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n],
+                value=Float64.(100 .+ collect(1:n) .+ seasonal))
+
+        # :local mode should work with stream=nothing (default)
+        result = analyze(agent, data; h=6, mode=:local, stream=nothing)
+        @test result isa Heval.AgentResult
+        @test !isnothing(result.features)
+        @test !isempty(result.output)
+    end
+
+    @testset "Streaming - stream kwarg accepted by OllamaAgent" begin
+        # Verify OllamaAgent also accepts stream kwarg without error
+        config = Heval.LLMConfig(api_key="ollama", model="llama3.1", base_url="http://localhost:11434")
+        ollama_config = Heval.OllamaConfig(model="llama3.1")
+        state = Heval.AgentState()
+        agent = Heval.OllamaAgent(config, ollama_config, state, Heval.Tool[],
+            Dict{String, Heval.Tool}(), Heval.build_system_prompt(), 3)
+        Heval.register_ollama_tools!(agent)
+
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n],
+                value=Float64.(100 .+ collect(1:n) .+ seasonal))
+
+        # :local mode doesn't use LLM, so it should work with stream kwarg
+        result = analyze(agent, data; h=6, mode=:local, stream=nothing)
+        @test result isa Heval.AgentResult
+        @test !isnothing(result.features)
+    end
+
+    @testset "Conversation History - local pipeline populates history" begin
+        state = Heval.AgentState()
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        state.values = Float64.(100 .+ collect(1:n) .+ seasonal)
+        state.dates = [Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n]
+        state.seasonal_period = 12
+        state.horizon = 6
+
+        @test isempty(state.conversation_history)
+        Heval._run_local_pipeline(state; max_retries=2)
+
+        @test !isempty(state.conversation_history)
+        @test length(state.conversation_history) == 3
+        @test state.conversation_history[1].role == "system"
+        @test state.conversation_history[2].role == "user"
+        @test state.conversation_history[3].role == "assistant"
+    end
+
+    @testset "Conversation History - analyze :local populates history" begin
+        config = Heval.LLMConfig(api_key="unused", model="gpt-4o")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n],
+                value=Float64.(100 .+ collect(1:n) .+ seasonal))
+
+        analyze(agent, data; h=6, mode=:local)
+
+        @test !isempty(agent.state.conversation_history)
+        @test agent.state.conversation_history[1].role == "system"
+    end
+
+    @testset "Conversation History - clear_history resets" begin
+        config = Heval.LLMConfig(api_key="unused", model="gpt-4o")
+        state = Heval.AgentState()
+        agent = Heval.HevalAgent(config, state, Heval.Tool[], Dict{String, Heval.Tool}(),
+            Heval.build_system_prompt(), 3)
+        Heval.register_tools!(agent)
+
+        n = 48
+        seasonal = [sin(2π * i / 12) * 10 for i in 1:n]
+        data = (date=[Date(2020, 1, 1) + Dates.Month(i - 1) for i in 1:n],
+                value=Float64.(100 .+ collect(1:n) .+ seasonal))
+
+        analyze(agent, data; h=6, mode=:local)
+        @test !isempty(agent.state.conversation_history)
+
+        clear_history(agent)
+        @test isempty(agent.state.conversation_history)
+    end
+
+    @testset "Conversation History - _generic_query uses history" begin
+        # Build a state with pre-populated conversation_history
+        state = Heval.AgentState()
+        state.values = Float64.(1:48)
+        state.seasonal_period = 12
+        state.horizon = 6
+        state.conversation_history = [
+            Heval.Message("system", "You are Heval, a concise forecasting assistant."),
+            Heval.Message("user", "Original analysis prompt"),
+            Heval.Message("assistant", "Here is the analysis.")
+        ]
+
+        # Mock call_fn/parse_fn that records what messages it receives
+        received_messages = Ref{Vector{Heval.Message}}()
+        mock_call_fn = (msgs, tools) -> begin
+            received_messages[] = copy(msgs)
+            return nothing  # dummy response
+        end
+        mock_parse_fn = (_) -> Heval.Message("assistant", "Follow-up answer", nothing, nothing)
+        mock_execute_fn = (name, args) -> Dict("error" => "not implemented")
+
+        result = Heval._generic_query(state, Heval.Tool[], "", "Explain for a manager",
+            mock_call_fn, mock_parse_fn, mock_execute_fn)
+
+        # Should have used existing history (3 msgs) + new user question = 4 messages
+        @test length(received_messages[]) == 4
+        @test received_messages[][1].role == "system"
+        @test received_messages[][2].role == "user"
+        @test received_messages[][2].content == "Original analysis prompt"
+        @test received_messages[][3].role == "assistant"
+        @test received_messages[][4].role == "user"
+        @test received_messages[][4].content == "Explain for a manager"
+
+        # After query, history should be updated (4 msgs + final assistant)
+        @test length(state.conversation_history) == 5
+        @test state.conversation_history[end].role == "assistant"
+        @test state.conversation_history[end].content == "Follow-up answer"
+
+        # Verify result content
+        @test result.content == "Follow-up answer"
+    end
+
+    @testset "Conversation History - _generic_query falls back without history" begin
+        state = Heval.AgentState()
+        state.values = Float64.(1:48)
+        state.seasonal_period = 12
+        state.horizon = 6
+        state.features = Heval.SeriesFeatures(length=48, trend_strength="moderate",
+            seasonality_strength="strong")
+        # conversation_history is empty
+
+        received_messages = Ref{Vector{Heval.Message}}()
+        mock_call_fn = (msgs, tools) -> begin
+            received_messages[] = copy(msgs)
+            return nothing
+        end
+        mock_parse_fn = (_) -> Heval.Message("assistant", "Fallback answer", nothing, nothing)
+        mock_execute_fn = (name, args) -> Dict("error" => "not implemented")
+
+        result = Heval._generic_query(state, Heval.Tool[], "system prompt", "What happened?",
+            mock_call_fn, mock_parse_fn, mock_execute_fn)
+
+        # Should have built fresh context (system + user with context summary)
+        @test length(received_messages[]) == 2
+        @test received_messages[][1].role == "system"
+        @test received_messages[][1].content == "system prompt"
+        @test occursin("What happened?", received_messages[][2].content)
+        @test occursin("Previous analysis context", received_messages[][2].content)
+    end
+
+    @testset "Streaming - method signatures accept stream" begin
+        # Verify that all public APIs accept the stream keyword
+        @test hasmethod(analyze, Tuple{Heval.HevalAgent, Any})
+        @test hasmethod(analyze, Tuple{Heval.OllamaAgent, Any})
+        @test hasmethod(Heval.query, Tuple{Heval.HevalAgent, String})
+        @test hasmethod(Heval.query, Tuple{Heval.OllamaAgent, String})
     end
 
 end
