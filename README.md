@@ -23,6 +23,10 @@ TAFS's mission includes:
 
 As a registered non-profit association under Austrian law, TAFS ensures that all contributions remain fully open source and cannot be privatized or commercialized. [TAFS](https://taf-society.org/)
 
+## Built with Zana.jl
+
+This package was developed with the help of [Zana.jl](https://taf-society.github.io/Zana.jl/dev/) — a terminal-based AI coding assistant for Julia.
+
 ## License
 
 The Heval package is licensed under the **MIT License**, allowing for open-source distribution and collaboration.

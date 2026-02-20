@@ -166,6 +166,12 @@ data = (date=dates, store=stores, value=values)
 
 ---
 
+## Built with Zana.jl
+
+This package was developed with the help of [Zana.jl](https://taf-society.github.io/Zana.jl/dev/) — a terminal-based AI coding assistant for Julia that integrates LLMs directly into your development workflow.
+
+---
+
 ## What's Next
 
 - **[Quick Start](quickstart.md)** — Get started with your first analysis
