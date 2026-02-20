@@ -133,7 +133,7 @@ end
 # ============================================================================
 
 """
-    analyze(agent, data; h=nothing, m=nothing, query=nothing, groupby=nothing, ...)
+    analyze(agent, data; h=nothing, m=nothing, query=nothing, mode=:fast, groupby=nothing, ...)
 
 Run the full forecasting workflow.
 
@@ -147,6 +147,10 @@ Run the full forecasting workflow.
 - `h::Int` - Forecast horizon (default: 2*m)
 - `m::Int` - Seasonal period (default: 12)
 - `query::String` - Natural language instructions (optional)
+- `mode::Symbol` - Pipeline mode (default: `:fast`)
+  - `:fast` — deterministic pipeline + 1 LLM call for interpretation (~5x faster)
+  - `:local` — deterministic pipeline only, no LLM calls (batch/CI use)
+  - `:agentic` — full LLM-driven agent loop (5+ LLM calls, exploratory)
 - `groupby` - Column(s) for panel data grouping (optional)
 - `date` - Date column name for panel data (default: :date)
 - `target` - Target column name for panel data (default: :value)
@@ -156,9 +160,15 @@ Run the full forecasting workflow.
 
 # Examples
 ```julia
-# Single series
+# Fast mode (default) — 1 LLM call
 data = (date = Date.(2020, 1:36), value = rand(36) .* 100)
 result = analyze(agent, data; h=12, query="Forecast next year")
+
+# Local mode — no LLM needed
+result = analyze(agent, data; h=12, mode=:local)
+
+# Agentic mode — full LLM loop (backward compat)
+result = analyze(agent, data; h=12, mode=:agentic)
 
 # Panel data
 panel_data = (date=dates, store=stores, value=values)
@@ -171,10 +181,18 @@ function analyze(
     h::Union{Int, Nothing} = nothing,
     m::Union{Int, Nothing} = nothing,
     query::Union{String, Nothing} = nothing,
+    mode::Symbol = :fast,
     groupby::Union{Vector{Symbol}, Symbol, Nothing} = nothing,
     date::Union{Symbol, Nothing} = nothing,
-    target::Union{Symbol, Nothing} = nothing
+    target::Union{Symbol, Nothing} = nothing,
+    on_progress::ProgressCallback = nothing,
+    stream::Union{IO, Nothing} = nothing
 )
+    # Validate mode
+    if !(mode in (:fast, :local, :agentic))
+        error("Unknown mode: :$mode. Use :fast, :local, or :agentic.")
+    end
+
     # Set defaults
     m = isnothing(m) ? 12 : m
     h = isnothing(h) ? 2 * m : h
@@ -183,10 +201,15 @@ function analyze(
     is_panel = !isnothing(groupby)
 
     if is_panel
+        if mode != :agentic
+            @warn "Panel data requires :agentic mode; ignoring mode=:$mode"
+        end
         return _analyze_panel(agent, data; h=h, m=m, query=query,
                               groupby=groupby isa Symbol ? [groupby] : groupby,
                               date_col=something(date, :date),
-                              target_col=something(target, :value))
+                              target_col=something(target, :value),
+                              on_progress=on_progress,
+                              stream=stream)
     end
 
     # ── Single-series path ─────────────────────────────────────────────────
@@ -203,8 +226,19 @@ function analyze(
     agent.system_prompt = build_system_prompt(; is_panel=false)
     register_tools!(agent)
 
-    # Build user prompt
-    data_summary = """
+    # Route based on mode
+    if mode == :local
+        return _run_local_pipeline(agent.state;
+                                    max_retries=agent.max_retries,
+                                    on_progress=on_progress)
+    elseif mode == :fast
+        return _run_fast_pipeline(agent, query;
+                                   max_retries=agent.max_retries,
+                                   on_progress=on_progress,
+                                   stream=stream)
+    else  # :agentic
+        # Build user prompt
+        data_summary = """
 Data summary:
 - Length: $(length(values)) observations
 - Date range: $(isnothing(dates) ? "not provided" : "$(dates[1]) to $(dates[end])")
@@ -216,7 +250,7 @@ Data summary:
 - Forecast horizon (h): $h
 """
 
-    user_prompt = """
+        user_prompt = """
 $data_summary
 
 $(isnothing(query) ? "Please analyze this time series and generate forecasts." : "User request: $query")
@@ -224,14 +258,17 @@ $(isnothing(query) ? "Please analyze this time series and generate forecasts." :
 Follow the workflow: analyze_features → cross_validate → generate_forecast → detect_anomalies
 """
 
-    return _run_agent_loop(agent, user_prompt)
+        return _run_agent_loop(agent, user_prompt; on_progress=on_progress, stream=stream)
+    end
 end
 
 function _analyze_panel(agent::HevalAgent, data;
                         h::Int, m::Int,
                         query::Union{String, Nothing},
                         groupby::Vector{Symbol},
-                        date_col::Symbol, target_col::Symbol)
+                        date_col::Symbol, target_col::Symbol,
+                        on_progress::ProgressCallback=nothing,
+                        stream::Union{IO, Nothing}=nothing)
     # Initialize state with panel
     agent.state = AgentState()
     agent.state.seasonal_period = m
@@ -283,11 +320,26 @@ $(isnothing(query) ? "Please analyze this panel data and generate forecasts." : 
 For panel data, use panel_analyze → analyze_features → cross_validate or panel_fit → detect_anomalies
 """
 
-    return _run_agent_loop(agent, user_prompt)
+    return _run_agent_loop(agent, user_prompt; on_progress=on_progress, stream=stream)
 end
 
 """
-    _run_generic_agent_loop(state, tools, system_prompt, max_retries, user_prompt, call_fn, parse_fn, execute_fn)
+    _emit(cb, event)
+
+Safely invoke a progress callback. Swallows any errors so a broken callback
+never crashes the agent loop.
+"""
+function _emit(cb::ProgressCallback, event::AgentEvent)
+    isnothing(cb) && return
+    try
+        cb(event)
+    catch
+    end
+    return
+end
+
+"""
+    _run_generic_agent_loop(state, tools, system_prompt, max_retries, user_prompt, call_fn, parse_fn, execute_fn; on_progress=nothing)
 
 Shared agent loop used by both HevalAgent and OllamaAgent.
 `call_fn(messages, tools)` → raw response
@@ -297,7 +349,10 @@ Shared agent loop used by both HevalAgent and OllamaAgent.
 function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
                                   system_prompt::String, max_retries::Int,
                                   user_prompt::String,
-                                  call_fn::Function, parse_fn::Function, execute_fn::Function)
+                                  call_fn::Function, parse_fn::Function, execute_fn::Function;
+                                  on_progress::ProgressCallback=nothing,
+                                  stream::Union{IO, Nothing}=nothing,
+                                  stream_fn::Union{Function, Nothing}=nothing)
     messages = [
         Message("system", system_prompt),
         Message("user", user_prompt)
@@ -308,15 +363,19 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
 
     for retry in 1:max_retries
         for _round in 1:max_tool_rounds
+            _emit(on_progress, AgentEvent(llm_start, _round; message="Calling LLM (round $_round)"))
             response = call_fn(messages, tools)
             assistant_msg = parse_fn(response)
+            _emit(on_progress, AgentEvent(llm_done, _round; message="LLM responded"))
 
             if !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
                 push!(messages, assistant_msg)
 
                 for tc in assistant_msg.tool_calls
+                    _emit(on_progress, AgentEvent(tool_start, _round; tool_name=tc.name, message="Running $(tc.name)"))
                     result = execute_fn(tc.name, tc.arguments)
                     push!(messages, format_tool_result(tc.id, result))
+                    _emit(on_progress, AgentEvent(tool_done, _round; tool_name=tc.name, message="Completed $(tc.name)"))
                 end
 
                 continue
@@ -324,6 +383,14 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
 
             final_output = something(assistant_msg.content, "")
             push!(messages, assistant_msg)
+
+            # Write final response to stream if set
+            if !isnothing(stream) && !isempty(final_output)
+                print(stream, final_output)
+                println(stream)
+                flush(stream)
+            end
+
             break
         end
 
@@ -333,6 +400,7 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
                          state.accuracy["SNaive"].mase : Inf
 
             if best_mase >= naive_mase
+                _emit(on_progress, AgentEvent(retry, retry; message="Retry $retry: best model didn't beat SNaive"))
                 push!(messages, Message("user",
                     "The best model doesn't beat the SNaive baseline. " *
                     "Please try additional models (e.g., ARIMA, ETS, Theta, ARAR, BATS) " *
@@ -345,13 +413,10 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
         break
     end
 
-    beats_baseline = if !isempty(state.accuracy) && !isnothing(state.best_model)
-        best_mase = state.accuracy[state.best_model].mase
-        naive_mase = get(state.accuracy, "SNaive", AccuracyMetrics(model="SNaive")).mase
-        best_mase < naive_mase
-    else
-        false
-    end
+    _emit(on_progress, AgentEvent(agent_done, 0; message="Agent loop finished"))
+
+    # Persist conversation for follow-up queries
+    state.conversation_history = messages
 
     return AgentResult(
         final_output,
@@ -360,84 +425,356 @@ function _run_generic_agent_loop(state::AgentState, tools::Vector{Tool},
         state.forecasts,
         state.anomalies,
         state.best_model,
-        beats_baseline
+        _compute_beats_baseline(state)
     )
 end
 
 """
-    _generic_query(state, tools, system_prompt, question, call_fn, parse_fn, execute_fn)
+    _generic_query(state, tools, system_prompt, question, call_fn, parse_fn, execute_fn; on_progress=nothing)
 
 Shared query loop used by both HevalAgent and OllamaAgent.
 """
 function _generic_query(state::AgentState, tools::Vector{Tool},
                         system_prompt::String, question::String,
-                        call_fn::Function, parse_fn::Function, execute_fn::Function)
+                        call_fn::Function, parse_fn::Function, execute_fn::Function;
+                        on_progress::ProgressCallback=nothing,
+                        stream::Union{IO, Nothing}=nothing,
+                        stream_fn::Union{Function, Nothing}=nothing)
     if isnothing(state.values) && isnothing(state.panel)
         error("No analysis has been run. Call analyze() first.")
     end
 
-    context_parts = ["Previous analysis context:"]
+    # Use existing conversation history if available, otherwise build fresh context
+    if !isempty(state.conversation_history)
+        messages = copy(state.conversation_history)
+        push!(messages, Message("user", question))
+    else
+        context_parts = ["Previous analysis context:"]
 
-    if !isnothing(state.features)
-        f = state.features
-        push!(context_parts, "- Data: $(f.length) obs, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength)")
-        if f.stationarity != "unknown"
-            push!(context_parts, "- Stationarity: $(f.stationarity)")
+        if !isnothing(state.features)
+            f = state.features
+            push!(context_parts, "- Data: $(f.length) obs, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength)")
+            if f.stationarity != "unknown"
+                push!(context_parts, "- Stationarity: $(f.stationarity)")
+            end
         end
+
+        if !isempty(state.accuracy) && !isnothing(state.best_model)
+            push!(context_parts, "- Models evaluated: $(join(keys(state.accuracy), ", "))")
+            push!(context_parts, "- Best model: $(state.best_model) (MASE=$(state.accuracy[state.best_model].mase))")
+        end
+
+        if !isnothing(state.forecasts)
+            fc = state.forecasts
+            push!(context_parts, "- Forecast: $(fc.horizon) periods using $(fc.model)")
+        end
+
+        if !isempty(state.anomalies)
+            push!(context_parts, "- Anomalies detected: $(length(state.anomalies))")
+        end
+
+        if !isnothing(state.panel)
+            push!(context_parts, "- Panel data: groups=$(join(String.(state.panel.groups), ", "))")
+        end
+
+        context = join(context_parts, "\n")
+
+        messages = [
+            Message("system", system_prompt),
+            Message("user", "$context\n\nUser question: $question")
+        ]
     end
 
-    if !isempty(state.accuracy) && !isnothing(state.best_model)
-        push!(context_parts, "- Models evaluated: $(join(keys(state.accuracy), ", "))")
-        push!(context_parts, "- Best model: $(state.best_model) (MASE=$(state.accuracy[state.best_model].mase))")
-    end
-
-    if !isnothing(state.forecasts)
-        fc = state.forecasts
-        push!(context_parts, "- Forecast: $(fc.horizon) periods using $(fc.model)")
-    end
-
-    if !isempty(state.anomalies)
-        push!(context_parts, "- Anomalies detected: $(length(state.anomalies))")
-    end
-
-    if !isnothing(state.panel)
-        push!(context_parts, "- Panel data: groups=$(join(String.(state.panel.groups), ", "))")
-    end
-
-    context = join(context_parts, "\n")
-
-    messages = [
-        Message("system", system_prompt),
-        Message("user", "$context\n\nUser question: $question")
-    ]
-
+    _round = 1
+    _emit(on_progress, AgentEvent(llm_start, _round; message="Calling LLM"))
     response = call_fn(messages, tools)
     assistant_msg = parse_fn(response)
+    _emit(on_progress, AgentEvent(llm_done, _round; message="LLM responded"))
 
     while !isnothing(assistant_msg.tool_calls) && !isempty(assistant_msg.tool_calls)
         push!(messages, assistant_msg)
 
         for tc in assistant_msg.tool_calls
+            _emit(on_progress, AgentEvent(tool_start, _round; tool_name=tc.name, message="Running $(tc.name)"))
             result = execute_fn(tc.name, tc.arguments)
             push!(messages, format_tool_result(tc.id, result))
+            _emit(on_progress, AgentEvent(tool_done, _round; tool_name=tc.name, message="Completed $(tc.name)"))
         end
 
+        _round += 1
+        _emit(on_progress, AgentEvent(llm_start, _round; message="Calling LLM (round $_round)"))
         response = call_fn(messages, tools)
         assistant_msg = parse_fn(response)
+        _emit(on_progress, AgentEvent(llm_done, _round; message="LLM responded"))
     end
 
-    return QueryResult(something(assistant_msg.content, ""))
+    final_text = something(assistant_msg.content, "")
+    push!(messages, assistant_msg)
+
+    # Write final response to stream if set
+    if !isnothing(stream) && !isempty(final_text)
+        print(stream, final_text)
+        println(stream)
+        flush(stream)
+    end
+
+    # Persist conversation for subsequent queries
+    state.conversation_history = messages
+
+    _emit(on_progress, AgentEvent(agent_done, _round; message="Query finished"))
+    return QueryResult(final_text)
+end
+
+# ============================================================================
+# Fast / Local Pipeline Helpers
+# ============================================================================
+
+"""
+    _compute_beats_baseline(state::AgentState) -> Bool
+
+Check if the best model beats the SNaive baseline on MASE.
+"""
+function _compute_beats_baseline(state::AgentState)
+    if !isempty(state.accuracy) && !isnothing(state.best_model)
+        best_mase = state.accuracy[state.best_model].mase
+        naive_mase = get(state.accuracy, "SNaive", AccuracyMetrics(model="SNaive")).mase
+        return best_mase < naive_mase
+    end
+    return false
+end
+
+"""
+    _run_deterministic_steps!(state::AgentState; max_retries::Int=2, on_progress=nothing)
+
+Run the deterministic pipeline: features → model selection → CV (with retry) → forecast → anomalies.
+Modifies `state` in place.
+"""
+function _run_deterministic_steps!(state::AgentState;
+                                    max_retries::Int=2,
+                                    on_progress::ProgressCallback=nothing)
+    # Step 1: Analyze features
+    _emit(on_progress, AgentEvent(tool_start, 1; tool_name="analyze_features", message="Analyzing features"))
+    tool_analyze_features(state, Dict{String, Any}())
+    _emit(on_progress, AgentEvent(tool_done, 1; tool_name="analyze_features", message="Features analyzed"))
+
+    if isnothing(state.features)
+        return
+    end
+
+    # Step 2: Select candidate models and cross-validate
+    candidates = _select_candidate_models(state.features)
+    _emit(on_progress, AgentEvent(tool_start, 2; tool_name="cross_validate", message="Cross-validating $(length(candidates)) models"))
+    tool_cross_validate(state, Dict{String, Any}("models" => candidates))
+    _emit(on_progress, AgentEvent(tool_done, 2; tool_name="cross_validate", message="Cross-validation done"))
+
+    # Step 2b: Retry if best doesn't beat SNaive
+    for retry in 1:max_retries
+        if _compute_beats_baseline(state)
+            break
+        end
+        already_tried = collect(keys(state.accuracy))
+        extra = _expand_candidate_models(already_tried, state.features)
+        if isempty(extra)
+            break
+        end
+        _emit(on_progress, AgentEvent(Heval.retry, retry; message="Retry $retry: trying $(length(extra)) more models"))
+        tool_cross_validate(state, Dict{String, Any}("models" => extra))
+    end
+
+    # Step 3: Generate forecast with best model
+    best = state.best_model
+    if !isnothing(best)
+        _emit(on_progress, AgentEvent(tool_start, 3; tool_name="generate_forecast", message="Forecasting with $best"))
+        tool_generate_forecast(state, Dict{String, Any}("model" => best))
+        _emit(on_progress, AgentEvent(tool_done, 3; tool_name="generate_forecast", message="Forecast generated"))
+
+        # Step 4: Detect anomalies
+        _emit(on_progress, AgentEvent(tool_start, 4; tool_name="detect_anomalies", message="Detecting anomalies"))
+        tool_detect_anomalies(state, Dict{String, Any}("model" => best))
+        _emit(on_progress, AgentEvent(tool_done, 4; tool_name="detect_anomalies", message="Anomaly detection done"))
+    end
+
+    return
+end
+
+"""
+    _build_results_summary(state::AgentState; query=nothing) -> String
+
+Build a programmatic text summary of the analysis results (used by :local mode).
+"""
+function _build_results_summary(state::AgentState; query::Union{String, Nothing}=nothing)
+    parts = String[]
+
+    # Features
+    if !isnothing(state.features)
+        f = state.features
+        push!(parts, "Series: $(f.length) observations, trend=$(f.trend_strength), seasonality=$(f.seasonality_strength), stationarity=$(f.stationarity)")
+    end
+
+    # Accuracy
+    if !isempty(state.accuracy)
+        sorted = sort(collect(state.accuracy), by=x -> x.second.mase)
+        lines = ["  $(k): MASE=$(v.mase), RMSE=$(v.rmse), MAE=$(v.mae), MAPE=$(v.mape)%" for (k, v) in sorted]
+        push!(parts, "Model comparison (by MASE):\n" * join(lines, "\n"))
+
+        if !isnothing(state.best_model)
+            bb = _compute_beats_baseline(state)
+            push!(parts, "Best model: $(state.best_model) (MASE=$(state.accuracy[state.best_model].mase), $(bb ? "beats" : "does not beat") SNaive)")
+        end
+    end
+
+    # Forecast
+    if !isnothing(state.forecasts)
+        fc = state.forecasts
+        push!(parts, "Forecast: $(fc.horizon) periods ahead using $(fc.model), range $(round(minimum(fc.point_forecasts), digits=2)) to $(round(maximum(fc.point_forecasts), digits=2))")
+    end
+
+    # Anomalies
+    if !isempty(state.anomalies)
+        n_anom = length(state.anomalies)
+        push!(parts, "Anomalies: $n_anom detected")
+    else
+        push!(parts, "Anomalies: none detected")
+    end
+
+    return join(parts, "\n\n")
+end
+
+"""
+    _build_interpretation_prompt(state::AgentState; query=nothing) -> String
+
+Build a compressed prompt for a single LLM interpretation call in :fast mode.
+"""
+function _build_interpretation_prompt(state::AgentState; query::Union{String, Nothing}=nothing)
+    summary = _build_results_summary(state; query=query)
+
+    request = isnothing(query) ? "Provide a concise analysis summary with key insights and recommendations." :
+                                  "User request: $query"
+
+    return """You are Heval, a forecasting assistant. Based on the analysis results below, provide a clear and concise interpretation.
+
+Analysis Results:
+$summary
+
+$request
+
+Be direct. Highlight the most important findings: model performance, forecast direction, any anomalies, and actionable recommendations."""
+end
+
+"""
+    _run_local_pipeline(state::AgentState; max_retries=2, on_progress=nothing) -> AgentResult
+
+Run the deterministic pipeline with a programmatic summary (no LLM calls).
+"""
+function _run_local_pipeline(state::AgentState;
+                              max_retries::Int=2,
+                              on_progress::ProgressCallback=nothing)
+    _run_deterministic_steps!(state; max_retries=max_retries, on_progress=on_progress)
+    output = _build_results_summary(state)
+    _emit(on_progress, AgentEvent(agent_done, 0; message="Local pipeline finished"))
+
+    # Persist minimal conversation for follow-up queries
+    state.conversation_history = [
+        Message("system", "You are Heval, a concise forecasting assistant."),
+        Message("user", "Analysis results:\n$output"),
+        Message("assistant", output)
+    ]
+
+    return AgentResult(
+        output,
+        state.features,
+        state.accuracy,
+        state.forecasts,
+        state.anomalies,
+        state.best_model,
+        _compute_beats_baseline(state)
+    )
+end
+
+"""
+    _call_llm_for_interpretation(agent::HevalAgent, prompt::String) -> String
+
+Make a single LLM call for interpretation (no tools).
+"""
+function _call_llm_for_interpretation(agent::HevalAgent, prompt::String)
+    messages = [
+        Message("system", "You are Heval, a concise forecasting assistant."),
+        Message("user", prompt)
+    ]
+    response = call_llm(agent.config, messages, Tool[])
+    assistant_msg = parse_llm_response(response)
+    return something(assistant_msg.content, "")
+end
+
+"""
+    _run_fast_pipeline(agent::HevalAgent, query; max_retries=2, on_progress=nothing) -> AgentResult
+
+Run the deterministic pipeline + one LLM call for interpretation.
+"""
+function _run_fast_pipeline(agent::HevalAgent, query::Union{String, Nothing};
+                             max_retries::Int=2,
+                             on_progress::ProgressCallback=nothing,
+                             stream::Union{IO, Nothing}=nothing)
+    state = agent.state
+    _run_deterministic_steps!(state; max_retries=max_retries, on_progress=on_progress)
+
+    # Single LLM call for interpretation
+    prompt = _build_interpretation_prompt(state; query=query)
+    output = try
+        _emit(on_progress, AgentEvent(llm_start, 1; message="LLM interpretation"))
+        result = if !isnothing(stream)
+            messages = [
+                Message("system", "You are Heval, a concise forecasting assistant."),
+                Message("user", prompt)
+            ]
+            text = call_llm_streaming(agent.config, messages,
+                token -> print(stream, token))
+            flush(stream)
+            println(stream)
+            text
+        else
+            _call_llm_for_interpretation(agent, prompt)
+        end
+        _emit(on_progress, AgentEvent(llm_done, 1; message="Interpretation done"))
+        result
+    catch e
+        @warn "LLM interpretation failed, using programmatic summary" exception=(e, catch_backtrace())
+        _build_results_summary(state; query=query)
+    end
+
+    _emit(on_progress, AgentEvent(agent_done, 0; message="Fast pipeline finished"))
+
+    # Persist conversation for follow-up queries
+    state.conversation_history = [
+        Message("system", "You are Heval, a concise forecasting assistant."),
+        Message("user", prompt),
+        Message("assistant", output)
+    ]
+
+    return AgentResult(
+        output,
+        state.features,
+        state.accuracy,
+        state.forecasts,
+        state.anomalies,
+        state.best_model,
+        _compute_beats_baseline(state)
+    )
 end
 
 # ── HevalAgent delegates ──────────────────────────────────────────────────
 
-function _run_agent_loop(agent::HevalAgent, user_prompt::String)
+function _run_agent_loop(agent::HevalAgent, user_prompt::String;
+                         on_progress::ProgressCallback=nothing,
+                         stream::Union{IO, Nothing}=nothing)
     call_fn = (msgs, tools) -> call_llm(agent.config, msgs, tools)
     parse_fn = parse_llm_response
     execute_fn = (name, args) -> execute_tool(agent, name, args)
     return _run_generic_agent_loop(agent.state, agent.tools, agent.system_prompt,
                                     agent.max_retries, user_prompt,
-                                    call_fn, parse_fn, execute_fn)
+                                    call_fn, parse_fn, execute_fn;
+                                    on_progress=on_progress,
+                                    stream=stream)
 end
 
 function execute_tool(agent::HevalAgent, name::String, args::Dict)
@@ -486,12 +823,16 @@ end
 
 Ask a follow-up question about the analysis.
 """
-function query(agent::HevalAgent, question::String)
+function query(agent::HevalAgent, question::String;
+               on_progress::ProgressCallback=nothing,
+               stream::Union{IO, Nothing}=nothing)
     call_fn = (msgs, tools) -> call_llm(agent.config, msgs, tools)
     parse_fn = parse_llm_response
     execute_fn = (name, args) -> execute_tool(agent, name, args)
     return _generic_query(agent.state, agent.tools, agent.system_prompt, question,
-                          call_fn, parse_fn, execute_fn)
+                          call_fn, parse_fn, execute_fn;
+                          on_progress=on_progress,
+                          stream=stream)
 end
 
 """
